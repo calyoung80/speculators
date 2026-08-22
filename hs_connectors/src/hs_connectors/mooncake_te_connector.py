@@ -11,7 +11,9 @@ the ``extract_hidden_states`` speculative method.
 
 from __future__ import annotations
 
+import os
 import re
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -159,6 +161,7 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._is_tp_rank_zero: bool = True
         self._accumulated_finished_req_ids: set[str] = set()
         self._saves_done: bool = False
+        self._prev_te_key: str | None = None
 
         if role == KVConnectorRole.WORKER:
             self._write_executor = ThreadPoolExecutor(max_workers=1)
@@ -179,6 +182,41 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     def start_load_kv(self, *args: Any, **kwargs: Any) -> None:
         if self._store_ready and self._store._send_hs_buffer is not None:
             self._store.reset_send_buffer()
+
+        # Option B: wait for previous request's ACK before this request's
+        # unified_kv_cache_update overwrites KV cache blocks.
+        # Only check on batches with new requests (prefill), not decode batches.
+        prev_key = self._prev_te_key
+        if prev_key is not None and self._store_ready:
+            try:
+                meta = self._get_connector_metadata()
+                has_new = hasattr(meta, "requests") and meta.requests
+            except Exception:
+                has_new = False
+            if has_new:
+                # Skip ACK check if previous key's metadata no longer exists
+                # (cleaned between training runs)
+                prev_meta = f"/tmp/te_meta/{prev_key}.json"
+                if not os.path.exists(prev_meta):
+                    self._prev_te_key = None
+                else:
+                    ack_path = f"/tmp/te_meta/{prev_key}.ack"
+                    t0 = time.perf_counter()
+                    ack_timeout = float(os.environ.get("TE_ACK_TIMEOUT", "5"))
+                    while not os.path.exists(ack_path):
+                        if time.perf_counter() - t0 > ack_timeout:
+                            logger.warning(
+                                "ACK timeout for prev_key=%s after %.1fs",
+                                prev_key, ack_timeout,
+                            )
+                            break
+                        time.sleep(0.01)
+                    else:
+                        try:
+                            os.remove(ack_path)
+                        except OSError:
+                            pass
+                    self._prev_te_key = None
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
@@ -298,6 +336,7 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         }
 
         self._store.put_sample(pending.te_key, tensor_specs)
+        self._prev_te_key = pending.te_key
 
     def get_finished(
         self, finished_req_ids: set[str]

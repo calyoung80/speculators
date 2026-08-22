@@ -398,6 +398,13 @@ class MooncakeTEStore:
                     tensor = self._token_buffer[:expected_numel].view(shape).clone()
                 result[name] = tensor
 
+        # Option B: write ACK file to signal producer that data has been read.
+        # This prevents the producer from overwriting KV cache blocks
+        # before the consumer finishes TE transfer (fixes NaN race condition).
+        ack_path = f"/tmp/te_meta/{key}.ack"
+        with open(ack_path, "w") as f:
+            f.write("ok")
+
         return result
 
     def delete_sample(self, key: str) -> None:
