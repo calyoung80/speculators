@@ -399,8 +399,6 @@ class MooncakeTEStore:
                 result[name] = tensor
 
         # Option B: write ACK file to signal producer that data has been read.
-        # This prevents the producer from overwriting KV cache blocks
-        # before the consumer finishes TE transfer (fixes NaN race condition).
         ack_path = f"/tmp/te_meta/{key}.ack"
         with open(ack_path, "w") as f:
             f.write("ok")
@@ -411,6 +409,11 @@ class MooncakeTEStore:
         path = self._meta_path(key)
         try:
             os.remove(path)
+        except FileNotFoundError:
+            pass
+        ack_path = f"/tmp/te_meta/{key}.ack"
+        try:
+            os.remove(ack_path)
         except FileNotFoundError:
             pass
 

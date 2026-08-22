@@ -185,7 +185,8 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Option B: wait for previous request's ACK before this request's
         # unified_kv_cache_update overwrites KV cache blocks.
-        # Only check on batches with new requests (prefill), not decode batches.
+        # Prevents model NaN (sample 3) from leaking to other samples (2,4)
+        # via block reuse. Only check on batches with new requests.
         prev_key = self._prev_te_key
         if prev_key is not None and self._store_ready:
             try:
@@ -194,8 +195,6 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             except Exception:
                 has_new = False
             if has_new:
-                # Skip ACK check if previous key's metadata no longer exists
-                # (cleaned between training runs)
                 prev_meta = f"/tmp/te_meta/{prev_key}.json"
                 if not os.path.exists(prev_meta):
                     self._prev_te_key = None
