@@ -535,8 +535,9 @@ def loss_function(
             pos_idx.to(elementwise_loss.dtype), elementwise_loss=elementwise_loss
         )
         elementwise_loss = elementwise_loss * decay_mult
-
-    denominator = loss_mask.sum(dim=1) + _EPS
+        denominator = (loss_mask * decay_mult).sum(dim=1) + _EPS
+    else:
+        denominator = loss_mask.sum(dim=1) + _EPS
 
     batch_loss = torch.sum(elementwise_loss, dim=1) / denominator  # shape: [1]
     return batch_loss.mean()  # shape: []

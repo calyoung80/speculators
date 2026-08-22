@@ -16,6 +16,7 @@ import torch
 from safetensors.torch import load_file
 
 from hs_connectors.mooncake_store import MooncakeHiddenStatesStore, MooncakeStoreConfig
+from hs_connectors.mooncake_te_store import MooncakeTEConfig, MooncakeTEStore
 
 if TYPE_CHECKING:
     import argparse
@@ -255,6 +256,12 @@ class MooncakeBackend(HiddenStatesBackend):
             default="tcp",
             help="Mooncake transport protocol. Used with backend=mooncake.",
         )
+        parser.add_argument(
+            "--mooncake-device",
+            type=str,
+            default="",
+            help="Mooncake RDMA device name (e.g. mlx5_0, auto-discovery). Used with backend=mooncake.",
+        )
 
     @staticmethod
     def add_train_args(parser: argparse.ArgumentParser) -> None:
@@ -279,6 +286,7 @@ class MooncakeBackend(HiddenStatesBackend):
                 metadata_server=args.mooncake_metadata_server,
                 master_server_address=args.mooncake_master,
                 protocol=args.mooncake_protocol,
+                device_name=getattr(args, "mooncake_device", "") or "",
             )
         )
         return MooncakeTransfer(store)
@@ -294,6 +302,7 @@ class MooncakeBackend(HiddenStatesBackend):
             metadata_server=args.mooncake_metadata_server,
             master_server_address=args.mooncake_master,
             protocol=args.mooncake_protocol,
+            device_name=getattr(args, "mooncake_device", "") or "",
         )
 
         return {
@@ -304,5 +313,112 @@ class MooncakeBackend(HiddenStatesBackend):
             ),
             "kv_connector_extra_config": {
                 "mooncake": dataclasses.asdict(mooncake_cfg),
+            },
+        }
+
+
+# ---------------------------------------------------------------------------
+# Mooncake TransferEngine backend (NPU direct, no DtoH copy)
+# ---------------------------------------------------------------------------
+
+
+class MooncakeTETransfer(HiddenStatesTransfer):
+    """TransferEngine NPU direct hidden-states transfer (consumer side)."""
+
+    def __init__(self, store: MooncakeTEStore):
+        self.store = store
+
+    def setup(self) -> None:
+        if not self.store.is_setup:
+            self.store.setup()
+
+    def _normalize_handle(self, handle: str) -> str:
+        import os
+        if "/" in handle or handle.endswith(".safetensors"):
+            handle = os.path.basename(handle)
+            if handle.endswith(".safetensors"):
+                handle = handle[:-len(".safetensors")]
+        return handle
+
+    def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:  # noqa: ARG002
+        return None
+
+    def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
+        return self.store.get_sample(self._normalize_handle(handle))
+
+    def delete(self, handle: str) -> None:
+        self.store.delete_sample(self._normalize_handle(handle))
+
+
+@HiddenStatesBackend.register("mooncake-te")
+class MooncakeTEBackend(HiddenStatesBackend):
+    """TransferEngine NPU direct backend (HCCS/RoCE, no DtoH copy)."""
+
+    @staticmethod
+    def _add_te_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--mooncake-te-zmq-port",
+            type=int,
+            default=9999,
+            help="ZMQ port for TransferEngine control plane. Used with backend=mooncake-te.",
+        )
+        parser.add_argument(
+            "--mooncake-te-producer-ip",
+            type=str,
+            default="",
+            help=(
+                "Producer (vLLM) IP for TransferEngine. If empty, extracted "
+                "from --vllm-endpoint. Used with backend=mooncake-te."
+            ),
+        )
+
+    @staticmethod
+    def add_train_args(parser: argparse.ArgumentParser) -> None:
+        MooncakeTEBackend._add_te_args(parser)
+
+    @staticmethod
+    def add_launch_args(parser: argparse.ArgumentParser) -> None:
+        MooncakeTEBackend._add_te_args(parser)
+
+    @staticmethod
+    def from_train_args(
+        args: argparse.Namespace,
+        data_path: str,  # noqa: ARG004
+    ) -> MooncakeTETransfer:
+        producer_ip = getattr(args, "mooncake_te_producer_ip", "") or ""
+        if not producer_ip:
+            from urllib.parse import urlparse
+
+            endpoint = getattr(args, "vllm_endpoint", "")
+            if endpoint:
+                producer_ip = urlparse(endpoint).hostname or ""
+
+        store = MooncakeTEStore(
+            MooncakeTEConfig(
+                zmq_port=getattr(args, "mooncake_te_zmq_port", 9999),
+                producer_ip=producer_ip,
+            )
+        )
+        return MooncakeTETransfer(store)
+
+    @staticmethod
+    def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:
+        local_hostname = os.environ.get(
+            "MOONCAKE_LOCAL_HOSTNAME"
+        ) or socket.gethostbyname(socket.gethostname())
+
+        te_cfg = MooncakeTEConfig(
+            local_hostname=local_hostname,
+            protocol="ascend",
+            zmq_port=getattr(args, "mooncake_te_zmq_port", 9999),
+            producer_ip="",  # producer: empty = ZMQ REP bind
+        )
+
+        return {
+            "kv_connector": "MooncakeTEHiddenStatesConnector",
+            "kv_role": "kv_producer",
+            "kv_connector_module_path": "hs_connectors.mooncake_te_connector",
+            "kv_connector_extra_config": {
+                "mooncake_te": dataclasses.asdict(te_cfg),
             },
         }
