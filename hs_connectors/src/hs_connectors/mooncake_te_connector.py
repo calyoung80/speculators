@@ -157,11 +157,14 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._request_keys: dict[str, str] = {}
         self._pending_saves: dict[str, PendingSave] = {}
 
+        # ACK sync: track previous request key to prevent KV cache block
+        # overwrite before consumer has read via TE transfer.
+        self._prev_te_key: str | None = None
+
         self._kv_cache: torch.Tensor | None = None
         self._is_tp_rank_zero: bool = True
         self._accumulated_finished_req_ids: set[str] = set()
         self._saves_done: bool = False
-        self._prev_te_key: str | None = None
 
         if role == KVConnectorRole.WORKER:
             self._write_executor = ThreadPoolExecutor(max_workers=1)
@@ -183,10 +186,8 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         if self._store_ready and self._store._send_hs_buffer is not None:
             self._store.reset_send_buffer()
 
-        # Option B: wait for previous request's ACK before this request's
+        # ACK sync: wait for previous request's ACK before this request's
         # unified_kv_cache_update overwrites KV cache blocks.
-        # Prevents model NaN (sample 3) from leaking to other samples (2,4)
-        # via block reuse. Only check on batches with new requests.
         prev_key = self._prev_te_key
         if prev_key is not None and self._store_ready:
             try:
@@ -289,16 +290,6 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self._kv_cache = kv_caches[cache_layers[0]]
         self._cache_layers = cache_layers
-
-        # Check kv_cache state right after allocation
-        torch.npu.synchronize()
-        nan_count = self._kv_cache.isnan().sum().item()
-        import sys
-        print(
-            f"[NAN_TRACE] register_kv_caches: kv_cache shape={list(self._kv_cache.shape)}, "
-            f"nan_at_init={nan_count}, dtype={self._kv_cache.dtype}",
-            file=sys.stderr, flush=True,
-        )
 
         # Register KV cache with TransferEngine (vllm-ascend pattern:
         # register once in register_kv_caches, use base_addr+offset for transfer)

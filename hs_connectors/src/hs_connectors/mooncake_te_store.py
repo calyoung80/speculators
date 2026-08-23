@@ -398,7 +398,7 @@ class MooncakeTEStore:
                     tensor = self._token_buffer[:expected_numel].view(shape).clone()
                 result[name] = tensor
 
-        # Option B: write ACK file to signal producer that data has been read.
+        # ACK sync: write ACK file to signal producer that data has been read.
         ack_path = f"/tmp/te_meta/{key}.ack"
         with open(ack_path, "w") as f:
             f.write("ok")
