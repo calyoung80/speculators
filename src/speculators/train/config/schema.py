@@ -376,6 +376,11 @@ class TrainerArgs(_Group):
         description="Save a checkpoint every N epochs. Values < 1 enable sub-epoch "
         "checkpointing (e.g. 0.5 = every half epoch).",
     )
+    checkpoint_step_interval: int | None = Field(
+        default=None,
+        description="Save a checkpoint every N optimizer steps (overrides checkpoint_freq "
+        "when set). Useful for monitoring intermediate progress during long training runs.",
+    )
     save_best: bool = Field(
         default=False,
         description="Also point a checkpoint at the lowest validation loss.",
@@ -401,6 +406,12 @@ class TrainerArgs(_Group):
         ge=1,
         description="Stop training after this many optimizer steps (counted across "
         "epochs). Useful for quick smoke runs. Default: run all epochs to completion.",
+    )
+    gradient_accumulation_steps: int = Field(
+        default=1,
+        ge=1,
+        description="Number of micro-batches to accumulate gradients over before "
+        "calling optimizer.step().",
     )
 
     @field_validator("checkpoint_freq")

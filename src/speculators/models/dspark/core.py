@@ -54,6 +54,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 config.markov_rank if config.confidence_head_with_markov else 0
             )
             self.confidence_head = ConfidenceHead(input_dim)
+        self.post_init()
 
     @classmethod
     def from_training_args(
