@@ -290,6 +290,16 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_cache = kv_caches[cache_layers[0]]
         self._cache_layers = cache_layers
 
+        # Check kv_cache state right after allocation
+        torch.npu.synchronize()
+        nan_count = self._kv_cache.isnan().sum().item()
+        import sys
+        print(
+            f"[NAN_TRACE] register_kv_caches: kv_cache shape={list(self._kv_cache.shape)}, "
+            f"nan_at_init={nan_count}, dtype={self._kv_cache.dtype}",
+            file=sys.stderr, flush=True,
+        )
+
         # Register KV cache with TransferEngine (vllm-ascend pattern:
         # register once in register_kv_caches, use base_addr+offset for transfer)
         if self._store.is_setup:
