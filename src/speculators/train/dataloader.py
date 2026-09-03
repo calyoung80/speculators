@@ -72,7 +72,7 @@ def _setup_dataloader(
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if use_workers else None,
-        pin_memory=True,
+        pin_memory=False,
         collate_fn=CollateFn(
             total_seq_len,
             hidden_size,

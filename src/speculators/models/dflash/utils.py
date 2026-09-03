@@ -44,9 +44,9 @@ def select_anchors(
     valid_mask = loss_mask.bool().clone()
     valid_mask[:, -block_size:] = False
 
-    valid_indices = torch.nonzero(valid_mask.squeeze(0), as_tuple=False).squeeze(
-        -1
-    )  # shape: [num_non_zero]
+    valid_indices = torch.nonzero(
+        valid_mask.squeeze(0).cpu(), as_tuple=False
+    ).squeeze(-1).to(loss_mask.device)  # shape: [num_non_zero]
 
     device = loss_mask.device
     anchors = torch.zeros(num_anchors, dtype=torch.long, device=device)

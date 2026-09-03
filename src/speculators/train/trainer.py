@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import json
 import logging
 import time
@@ -134,11 +135,13 @@ class TrainerConfig(NamedTuple):
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
     checkpoint_freq: float = 1
+    checkpoint_step_interval: int | None = None
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
     fsdp_shard: bool = False
     max_steps: int | None = None
+    gradient_accumulation_steps: int = 1
 
 
 def _resolve_scheduler_steps(
@@ -152,7 +155,7 @@ def _resolve_scheduler_steps(
     default of 1% of the resolved total steps. ``scheduler_total_steps`` defaults
     to ``num_epochs * train_loader_len``.
     """
-    default_total_steps = config.num_epochs * train_loader_len
+    default_total_steps = (config.num_epochs * train_loader_len) // max(config.gradient_accumulation_steps, 1)
     scheduler_total_steps = (
         config.scheduler_total_steps
         if config.scheduler_total_steps is not None
@@ -452,11 +455,11 @@ class Trainer:
         if self.rank == 0:
             train_loader = tqdm(train_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
 
-        step_interval = (
-            max(1, round(num_steps * self.config.checkpoint_freq))
-            if self.config.checkpoint_freq < 1
-            else None
-        )
+        step_interval = None
+        if self.config.checkpoint_step_interval is not None:
+            step_interval = self.config.checkpoint_step_interval
+        elif self.config.checkpoint_freq < 1:
+            step_interval = max(1, round(num_steps * self.config.checkpoint_freq))
         t_before_fetch = time.perf_counter()
         timer = _StepTimer()
         recovery = BatchRecoveryCoordinator("training")
@@ -495,8 +498,19 @@ class Trainer:
                 )
 
             timer.mark("fwd")
-            self._optimizers_zero_grad()
-            loss.backward()
+
+            grad_accum = self.config.gradient_accumulation_steps
+            is_sync_step = (local_step_rel % grad_accum == 0) or (local_step_rel == num_steps)
+            sync_context = nullcontext() if is_sync_step else self.model.no_sync()
+
+            with sync_context:
+                scaled_loss = loss / grad_accum
+                scaled_loss.backward()
+
+            if not is_sync_step:
+                t_before_fetch = time.perf_counter()
+                continue
+
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
             metrics["error_records_sum"] = torch.tensor(
@@ -508,6 +522,7 @@ class Trainer:
 
             timer.mark("bwd")
             self._optimizers_step()
+            self._optimizers_zero_grad()
 
             current_lrs = {
                 type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers

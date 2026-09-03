@@ -39,10 +39,13 @@ def _masked_decayed_mean(
     loss_mask = loss_mask.to(elementwise.dtype)
     weighted = elementwise * loss_mask
     if decay_fn is not None:
-        weighted = weighted * decay_fn(
+        decay_mult = decay_fn(
             pos_idx.to(weighted.dtype), elementwise_loss=elementwise
         )
-    denominator = loss_mask.sum(dim=1) + _EPS
+        weighted = weighted * decay_mult
+        denominator = (loss_mask * decay_mult).sum(dim=1) + _EPS
+    else:
+        denominator = loss_mask.sum(dim=1) + _EPS
     return (weighted.sum(dim=1) / denominator).mean()
 
 

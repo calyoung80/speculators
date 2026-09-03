@@ -22,10 +22,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.example_hidden_states_connector import (  # noqa: E501
-    ExampleHiddenStatesConnector,
-    extract_from_kv_cache,
-)
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -34,7 +30,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from hs_connectors.mooncake_store import (
     MooncakeHiddenStatesStore,
     MooncakeStoreConfig,
-    assert_finite,
 )
 
 if TYPE_CHECKING:
@@ -43,6 +38,13 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def extract_from_kv_cache(
+    kv_cache: torch.Tensor, slot_mapping: torch.Tensor, num_tokens: int
+) -> torch.Tensor:
+    block_size = kv_cache.shape[1]
+    return kv_cache[slot_mapping // block_size, slot_mapping % block_size][:num_tokens]
 
 
 def sanitize_key(key: str) -> str:
@@ -153,13 +155,17 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_cache: torch.Tensor | None = None
         self._is_tp_rank_zero: bool = True
         self._store_ready: bool = False
-        # Dedicated CUDA stream for DtoH copies so they don't block
-        # the default stream (model forward).
-        self._copy_stream: torch.cuda.Stream | None = None
+        self._copy_stream = None
         self._num_writer_threads = mooncake_cfg.num_writer_threads
         self._executor: ThreadPoolExecutor | None = None
         self._req_futures: dict[str, Future] = {}
         self._accumulated_finished_req_ids: set[str] = set()
+
+    @property
+    def _stream_mod(self):
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return torch.npu
+        return torch.cuda
 
     # ==============================
     # Worker-side methods
@@ -197,7 +203,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             f"Expected 1 CacheOnlyAttentionLayer, got {len(cache_layers)}"
         )
         self._kv_cache = kv_caches[cache_layers[0]]
-        self._copy_stream = torch.cuda.Stream()
+        self._copy_stream = self._stream_mod.Stream()
 
     def _get_executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
@@ -213,7 +219,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             self._store_ready = True
 
     def _write_sample(
-        self, pending: PendingSave, ready_event: torch.cuda.Event
+        self, pending: PendingSave, ready_event: Any
     ) -> None:
         assert self._kv_cache is not None
         assert self._copy_stream is not None
@@ -234,38 +240,22 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
         num_tokens = pending.token_ids.shape[0]
 
-        try:
-            with torch.cuda.stream(copy_stream):
-                slot_mapping = slot_mapping.to(self._kv_cache.device, non_blocking=True)
-                hidden_states = extract_from_kv_cache(
-                    self._kv_cache,
-                    slot_mapping,
-                    num_tokens,
-                )
-                assert_finite("hidden_states", hidden_states)
-                # Async DtoH copy into pinned host memory.
-                pinned_hs = torch.empty_like(
-                    hidden_states, device="cpu", pin_memory=True
-                )
-                pinned_hs.copy_(hidden_states, non_blocking=True)
-
-            # Wait for the DtoH copy to complete before handing data to the store.
-            copy_stream.synchronize()
-
-            self._store.put_sample(
-                pending.mooncake_key,
-                {"hidden_states": pinned_hs, "token_ids": pending.token_ids},
+        with self._stream_mod.stream(copy_stream):
+            slot_mapping = slot_mapping.to(self._kv_cache.device, non_blocking=True)
+            hidden_states = extract_from_kv_cache(
+                self._kv_cache, slot_mapping, num_tokens
             )
-        except Exception as exc:
-            try:
-                # Store error marker instead of the sample, so consumer can re-request
-                self._store.put_error(pending.mooncake_key, str(exc))
-            except Exception:
-                logger.exception(
-                    "Failed to publish Mooncake error marker for %s",
-                    pending.req_id,
-                )
-            raise
+            # Async DtoH copy into pinned host memory.
+            pinned_hs = torch.empty_like(hidden_states, device="cpu", pin_memory=True)
+            pinned_hs.copy_(hidden_states, non_blocking=True)
+
+        # Wait for the DtoH copy to complete before handing data to the store.
+        copy_stream.synchronize()
+
+        self._store.put_sample(
+            pending.mooncake_key,
+            {"hidden_states": pinned_hs, "token_ids": pending.token_ids},
+        )
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -282,7 +272,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                     # Record an event on the current (default) stream so
                     # the worker thread can wait for the forward pass to
                     # finish writing to the KV cache before reading it.
-                    ready_event = torch.cuda.Event()
+                    ready_event = self._stream_mod.Event()
                     ready_event.record()
                     self._req_futures[pending.req_id] = self._get_executor().submit(
                         self._write_sample, pending, ready_event
@@ -366,6 +356,11 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def get_required_kvcache_layout(
         cls,
-        vllm_config: VllmConfig,
+        vllm_config: VllmConfig,  # noqa: ARG003 (KVConnector interface)
     ) -> str | None:
-        return ExampleHiddenStatesConnector.get_required_kvcache_layout(vllm_config)
+        if cls is KVConnectorBase_V1:
+            raise TypeError(
+                "get_required_kvcache_layout should not be called on the base class"
+            )
+        # NHD keeps each token's hidden states contiguous in memory.
+        return "NHD"

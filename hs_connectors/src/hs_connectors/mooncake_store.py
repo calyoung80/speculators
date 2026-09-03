@@ -80,8 +80,8 @@ class MooncakeStoreConfig:
     local_hostname: str = "localhost"
     metadata_server: str = "P2PHANDSHAKE"
     master_server_address: str = "127.0.0.1:50051"
-    global_segment_size: int = 4 * 1024 * 1024 * 1024
-    local_buffer_size: int = 2 * 1024 * 1024 * 1024
+    global_segment_size: int = 1 * 1024 * 1024 * 1024
+    local_buffer_size: int = 512 * 1024 * 1024
     protocol: str = "tcp"
     device_name: str = ""
     num_writer_threads: int = 4
@@ -126,6 +126,20 @@ class MooncakeHiddenStatesStore:
                 "Install it with `pip install mooncake-transfer-engine` or "
                 "`pip install mooncake-transfer-engine-cuda13`."
             ) from e
+
+        try:
+            import torch_npu  # noqa: F401 # noqa: PLC0415
+            if torch.npu.is_available():
+                try:
+                    torch.npu.set_device(torch.npu.current_device())
+                except Exception:
+                    torch.npu.set_device(0)
+                logger.info(
+                    "torch_npu initialized for Mooncake ACL context, device=%s",
+                    torch.npu.current_device(),
+                )
+        except ImportError:
+            pass
 
         store = MooncakeDistributedStore()
         result = store.setup(
