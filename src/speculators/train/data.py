@@ -88,7 +88,9 @@ def build_client_item(dataset_item: dict) -> ClientItem:
     Text-only EAGLE-3 models (e.g. Llama) use a plain tokenizer, so
     ``messages`` is never created and this guard is a no-op.
     """
-    out_dict: dict = {"input_ids": dataset_item["input_ids"].tolist()}
+    _ids = dataset_item["input_ids"]
+    _ids = _ids if isinstance(_ids, list) else _ids.tolist()
+    out_dict: dict = {"input_ids": _ids}
 
     if "messages" in dataset_item and _has_multimodal_content(dataset_item["messages"]):
         out_dict["messages"] = dataset_item["messages"]
@@ -258,7 +260,9 @@ class ArrowDataset(BaseDataset):
 
             # Covers token/shape mismatches and non-finite values. The Mooncake
             # transfer performs manifest/checksum validation first.
-            check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+            _ids = dataset_item["input_ids"]
+            _ids = _ids if isinstance(_ids, list) else _ids.tolist()
+            check_hidden_states(loaded_hs, _ids)
 
             file_idx = self._map_to_file_idx(index)
             if self.on_generate == "cache":
@@ -288,10 +292,21 @@ class ArrowDataset(BaseDataset):
 
     def _get_raw_data(self, index: int) -> BatchType | SampleUnavailable:
         file_idx = self._map_to_file_idx(index)
+        dataset_item = self.data[index]
         cached_hs = self.transfer.get_cached(file_idx)
         if cached_hs is None:
             if self.on_missing == "generate":
-                dataset_item = self.data[index]
+                # Hidden-state extraction requests one generated token, so reserve
+                # that position within the same context budget as training.
+                request_max_len = self.max_len - 1
+                if len(dataset_item["input_ids"]) > request_max_len:
+                    dataset_item = dict(dataset_item)
+                    dataset_item["input_ids"] = dataset_item["input_ids"][
+                        :request_max_len
+                    ]
+                    dataset_item["loss_mask"] = dataset_item["loss_mask"][
+                        :request_max_len
+                    ]
                 client_item = build_client_item(dataset_item)
                 loaded_hs = self.generation_recovery.run(
                     lambda: self._generate_hidden_states_once(
@@ -327,7 +342,9 @@ class ArrowDataset(BaseDataset):
         #   "token_ids": [seq_len]
         # }
 
-        if not torch.equal(loaded_hs["token_ids"], self.data[index]["input_ids"]):
+        _ids = dataset_item["input_ids"]
+        _ids = _ids if hasattr(_ids, "tolist") else torch.tensor(_ids)
+        if not torch.equal(loaded_hs["token_ids"], _ids):
             warnings.warn(
                 f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
                 f"match input ids {self.data[index]['input_ids']}",
@@ -345,7 +362,7 @@ class ArrowDataset(BaseDataset):
             "verifier_last_hidden_states": loaded_hs["hidden_states"][
                 :, -1
             ],  # [seq_len, hidden_size]
-            "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
+            "loss_mask": dataset_item["loss_mask"],  # [seq_len]
         }
 
 
@@ -418,6 +435,8 @@ class CollateFn:
                 continue
             # one copy per sample: preallocated buffer, hidden states cast during write
             first = batch[0][key]  # type: ignore[index]
+            if not hasattr(first, "dtype"):
+                first = torch.tensor(first)
             buffer_dtype = dtype if "hidden_states" in key else first.dtype
             out = torch.zeros(
                 (max_len, *first.shape[1:]), dtype=buffer_dtype, device=first.device
@@ -425,6 +444,8 @@ class CollateFn:
             offset = 0
             for b in batch:
                 tensor = b[key]  # type: ignore[index]
+                if not hasattr(tensor, "shape"):
+                    tensor = torch.tensor(tensor)
                 num_rows = min(tensor.shape[0], max_len - offset)
                 out[offset : offset + num_rows] = tensor[:num_rows]
                 offset += num_rows

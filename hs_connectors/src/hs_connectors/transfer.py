@@ -334,10 +334,11 @@ class MooncakeTETransfer(HiddenStatesTransfer):
 
     def _normalize_handle(self, handle: str) -> str:
         import os
+
         if "/" in handle or handle.endswith(".safetensors"):
             handle = os.path.basename(handle)
             if handle.endswith(".safetensors"):
-                handle = handle[:-len(".safetensors")]
+                handle = handle[: -len(".safetensors")]
         return handle
 
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:  # noqa: ARG002

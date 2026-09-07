@@ -406,6 +406,18 @@ def test_resolve_dflash2_allows_explicit_causal_override():
     assert cfg.flatten()["sliding_window_non_causal"] is False
 
 
+def test_resolve_checkpoint_step_interval():
+    cfg = TrainConfig.resolve(
+        [
+            "--verifier-name-or-path",
+            "m",
+            "--checkpoint-step-interval",
+            "1000",
+        ]
+    )
+    assert cfg.flatten()["checkpoint_step_interval"] == 1000
+
+
 def test_resolve_config_error_exits_cleanly(capsys):
     with pytest.raises(SystemExit) as exc:
         TrainConfig.resolve(

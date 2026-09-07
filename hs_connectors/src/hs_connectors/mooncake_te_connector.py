@@ -68,7 +68,7 @@ class ReqMeta:
     token_ids: torch.Tensor
 
     @staticmethod
-    def make_meta(req_id: str, token_ids: list[int]) -> "ReqMeta":
+    def make_meta(req_id: str, token_ids: list[int]) -> ReqMeta:
         return ReqMeta(req_id=req_id, token_ids=torch.tensor(token_ids))
 
 
@@ -196,18 +196,20 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             except Exception:
                 has_new = False
             if has_new:
-                prev_meta = f"/tmp/te_meta/{prev_key}.json"
+                meta_dir = os.environ.get("TE_META_DIR", "/tmp/te_meta")
+                prev_meta = os.path.join(meta_dir, f"{prev_key}.json")
                 if not os.path.exists(prev_meta):
                     self._prev_te_key = None
                 else:
-                    ack_path = f"/tmp/te_meta/{prev_key}.ack"
+                    ack_path = os.path.join(meta_dir, f"{prev_key}.ack")
                     t0 = time.perf_counter()
                     ack_timeout = float(os.environ.get("TE_ACK_TIMEOUT", "5"))
                     while not os.path.exists(ack_path):
                         if time.perf_counter() - t0 > ack_timeout:
                             logger.warning(
                                 "ACK timeout for prev_key=%s after %.1fs",
-                                prev_key, ack_timeout,
+                                prev_key,
+                                ack_timeout,
                             )
                             break
                         time.sleep(0.01)
@@ -241,7 +243,10 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(attn_metadata, CacheOnlyAttentionMetadata)
 
         connector_metadata = self._get_connector_metadata()
-        if not hasattr(connector_metadata, "requests") or not connector_metadata.requests:
+        if (
+            not hasattr(connector_metadata, "requests")
+            or not connector_metadata.requests
+        ):
             return
 
         slot_mapping = get_forward_context().slot_mapping[layer_name]
@@ -291,48 +296,38 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_cache = kv_caches[cache_layers[0]]
         self._cache_layers = cache_layers
 
-        # Register KV cache with TransferEngine (vllm-ascend pattern:
-        # register once in register_kv_caches, use base_addr+offset for transfer)
-        if self._store.is_setup:
-            self._store.register_kv_cache(self._kv_cache)
-
     def _ensure_store(self) -> None:
         if not self._store_ready:
             self._store.setup()
             self._store_ready = True
-            # If kv_cache already available (register_kv_caches called before setup),
-            # register it now
-            if self._kv_cache is not None:
-                self._store.register_kv_cache(self._kv_cache)
 
     def _write_sample(self, pending: PendingSave) -> None:
         num_tokens = len(pending.token_ids)
-
-        # Block-based approach: write KV cache block addresses directly
-        block_size = self._kv_cache.shape[1]
-        slots = pending.slot_mapping
-        block_ids = (slots // block_size).unique().tolist()
-
-        blocks = []
-        per_token_bytes = self._kv_cache.element_size() * self._kv_cache.shape[2:].numel()
-        for bid in block_ids:
-            block_base = self._kv_cache.data_ptr() + bid * block_size * per_token_bytes
-            block_bytes = block_size * per_token_bytes
-            blocks.append({"ptr": block_base, "size": block_bytes})
+        ptr, size, shape = self._store.copy_to_send_buffer(
+            self._kv_cache, pending.slot_mapping, num_tokens
+        )
 
         tensor_specs = {
             "hidden_states": {
-                "blocks": blocks,
-                "per_token_bytes": per_token_bytes,
-                "shape": [num_tokens, self._kv_cache.shape[2], self._kv_cache.shape[3]],
+                "ptr": ptr,
+                "size": size,
+                "shape": shape,
                 "dtype": str(self._kv_cache.dtype),
             },
         }
 
-        tid_list = pending.token_ids.detach().contiguous().view(-1).to(torch.long).cpu().tolist()
+        tid_list = (
+            pending.token_ids.detach()
+            .contiguous()
+            .view(-1)
+            .to(torch.long)
+            .cpu()
+            .tolist()
+        )
         tensor_specs["token_ids"] = {
             "data": tid_list,
-            "shape": list(pending.token_ids.shape), "dtype": str(pending.token_ids.dtype),
+            "shape": list(pending.token_ids.shape),
+            "dtype": str(pending.token_ids.dtype),
         }
 
         self._store.put_sample(pending.te_key, tensor_specs)

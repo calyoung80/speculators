@@ -102,17 +102,22 @@ def render_throughput_defaults(cpus: int | None = None) -> tuple[int, int]:
 
 
 def _with_render_defaults(vllm_args: list[str]) -> list[str]:
-    """Prepend high-throughput render defaults, unless no API server is wanted."""
+    """Prepend missing render defaults, unless no API server is wanted."""
     if "--headless" in vllm_args:
         return vllm_args
     api_servers, renderer_workers = render_throughput_defaults()
-    return [
-        "--api-server-count",
-        str(api_servers),
-        "--renderer-num-workers",
-        str(renderer_workers),
-        *vllm_args,
-    ]
+    defaults: list[str] = []
+    if not any(
+        arg == "--api-server-count" or arg.startswith("--api-server-count=")
+        for arg in vllm_args
+    ):
+        defaults.extend(["--api-server-count", str(api_servers)])
+    if not any(
+        arg == "--renderer-num-workers" or arg.startswith("--renderer-num-workers=")
+        for arg in vllm_args
+    ):
+        defaults.extend(["--renderer-num-workers", str(renderer_workers)])
+    return [*defaults, *vllm_args]
 
 
 def _set_render_thread_defaults() -> None:

@@ -159,12 +159,17 @@ def maybe_setup_distributed(sp_size: int = 1) -> None:
     if os.environ.get("TE_PRE_INIT", "0") == "1":
         try:
             from hs_connectors.mooncake_te_store import pre_init_te_engine
+
             pre_init_te_engine()
-            logger.info("TE pre-init complete (ADXL before HCCL)",
-                        extra={"override_rank0_filter": True})
+            logger.info(
+                "TE pre-init complete (ADXL before HCCL)",
+                extra={"override_rank0_filter": True},
+            )
         except Exception as e:
-            logger.warning(f"TE pre-init failed (non-fatal): {e}",
-                           extra={"override_rank0_filter": True})
+            logger.warning(
+                f"TE pre-init failed (non-fatal): {e}",
+                extra={"override_rank0_filter": True},
+            )
 
     dist.init_process_group(backend, device_id=local_rank)
 

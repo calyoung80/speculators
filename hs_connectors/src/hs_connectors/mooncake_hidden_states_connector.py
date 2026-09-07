@@ -218,9 +218,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             self._store.setup()
             self._store_ready = True
 
-    def _write_sample(
-        self, pending: PendingSave, ready_event: Any
-    ) -> None:
+    def _write_sample(self, pending: PendingSave, ready_event: Any) -> None:
         assert self._kv_cache is not None
         assert self._copy_stream is not None
 

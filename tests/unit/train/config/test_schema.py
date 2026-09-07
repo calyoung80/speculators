@@ -33,6 +33,11 @@ def test_flatten_covers_exactly_the_schema_fields():
     assert list(flat) == list(TrainConfig(speculator_type="dflash").flatten())
 
 
+def test_checkpoint_step_interval_round_trips():
+    cfg = TrainConfig.from_flat({"checkpoint_step_interval": 1000})
+    assert cfg.flatten()["checkpoint_step_interval"] == 1000
+
+
 def test_flatten_resolves_eagle3_derived_defaults():
     # Mirrors the tail of the pre-refactor parse_args for the default (eagle3) run.
     flat = TrainConfig().flatten()

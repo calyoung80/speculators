@@ -37,9 +37,9 @@ def compute_accuracy_single_step(
         cond_total = prev_correct.sum().float()
         correct = torch.logical_and(prev_correct, correct, out=prev_correct)
     if loss_mask is not None:
-        correct = torch.masked_select(
-            correct.cpu(), loss_mask.to(torch.bool).cpu()
-        ).to(correct.device)
+        correct = torch.masked_select(correct.cpu(), loss_mask.to(torch.bool).cpu()).to(
+            correct.device
+        )
 
     correct_sum = correct.float().sum()
     full_total = torch.tensor(correct.numel(), dtype=torch.float, device=correct.device)
@@ -69,12 +69,12 @@ def compute_accuracy_multi_step(
         Overall counts can be derived by summing these.
     """
     correct = pred_ids == target_ids
-    correct = torch.masked_select(
-        correct.cpu(), loss_mask.to(torch.bool).cpu()
-    ).to(correct.device)
-    pos_idx = torch.masked_select(
-        pos_idx.cpu(), loss_mask.to(torch.bool).cpu()
-    ).to(pos_idx.device)
+    correct = torch.masked_select(correct.cpu(), loss_mask.to(torch.bool).cpu()).to(
+        correct.device
+    )
+    pos_idx = torch.masked_select(pos_idx.cpu(), loss_mask.to(torch.bool).cpu()).to(
+        pos_idx.device
+    )
 
     correct_per_pos = torch.zeros(num_pos, dtype=torch.float, device=correct.device)
     total_per_pos = torch.zeros(num_pos, dtype=torch.float, device=correct.device)

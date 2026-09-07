@@ -1,11 +1,13 @@
 """Runtime-aligned selector loss and metrics for DFlash2."""
 
+import math
 from collections.abc import Callable
 from functools import partial
 from typing import Any
 
 import torch
 from torch.nn import functional
+from torch.utils.checkpoint import checkpoint
 
 from speculators.losses import (
     LossConfig,
@@ -21,6 +23,212 @@ __all__ = [
     "compute_selector_loss",
     "selector_training_candidates",
 ]
+
+
+_VOCAB_CHUNK_SIZE = 2048
+
+
+def _chunked_logsumexp(
+    logits: torch.Tensor, chunk_size: int = _VOCAB_CHUNK_SIZE
+) -> torch.Tensor:
+    """Compute vocab logsumexp without materializing the full FP32 tensor."""
+    normalizer: torch.Tensor | None = None
+    for start in range(0, logits.shape[-1], chunk_size):
+        stop = min(start + chunk_size, logits.shape[-1])
+        chunk_normalizer = torch.logsumexp(logits[..., start:stop].float(), dim=-1)
+        if normalizer is None:
+            normalizer = chunk_normalizer
+        else:
+            normalizer = torch.logaddexp(normalizer, chunk_normalizer)
+    if normalizer is None:
+        raise ValueError("Cannot normalize logits with an empty vocabulary")
+    return normalizer
+
+
+_EPS = 1e-5
+
+
+def _kl_div_chunk(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    log_norm_p: torch.Tensor,
+) -> torch.Tensor:
+    target_logits = targets.float()
+    draft_logits = logits.float()
+    target_probs = torch.exp(target_logits - log_norm_p.unsqueeze(-1))
+    return (target_probs * (target_logits - draft_logits)).sum(dim=-1)
+
+
+def _chunked_kl_div(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Chunked KL(P||Q): sum_i P_i * (log P_i - log Q_i).
+
+    Processes vocab in chunks to avoid FP32 OOM on large vocab.
+    """
+    log_norm_q = _chunked_logsumexp(logits)
+    log_norm_p = _chunked_logsumexp(targets)
+    result = torch.zeros(logits.shape[:2], device=logits.device, dtype=torch.float32)
+    vocab_size = logits.shape[-1]
+    for start in range(0, vocab_size, _VOCAB_CHUNK_SIZE):
+        end = min(start + _VOCAB_CHUNK_SIZE, vocab_size)
+        args = (
+            logits[..., start:end],
+            targets[..., start:end],
+            log_norm_p,
+        )
+        if torch.is_grad_enabled():
+            result = result + checkpoint(_kl_div_chunk, *args, use_reentrant=False)
+        else:
+            result = result + _kl_div_chunk(*args)
+    result += log_norm_q - log_norm_p
+    return result
+
+
+def _chunked_reverse_kl(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Chunked RKL(Q||P): sum_i Q_i * (log Q_i - log P_i)."""
+    log_norm_q = _chunked_logsumexp(logits)
+    log_norm_p = _chunked_logsumexp(targets)
+    result = torch.zeros(logits.shape[:2], device=logits.device, dtype=torch.float32)
+    vocab_size = logits.shape[-1]
+    for start in range(0, vocab_size, _VOCAB_CHUNK_SIZE):
+        end = min(start + _VOCAB_CHUNK_SIZE, vocab_size)
+        ct = targets[..., start:end].float()
+        cl = logits[..., start:end].float()
+        q = torch.exp(cl - log_norm_q.unsqueeze(-1))
+        result += (q * (cl - ct)).sum(dim=-1)
+    result += log_norm_p - log_norm_q
+    return result
+
+
+def _chunked_jsd(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Chunked JSD: 0.5*KL(P||M) + 0.5*KL(Q||M), M=(P+Q)/2."""
+    log_norm_q = _chunked_logsumexp(logits)
+    log_norm_p = _chunked_logsumexp(targets)
+    kl_p_to_m = torch.zeros(logits.shape[:2], device=logits.device, dtype=torch.float32)
+    kl_q_to_m = torch.zeros(logits.shape[:2], device=logits.device, dtype=torch.float32)
+    vocab_size = logits.shape[-1]
+    for start in range(0, vocab_size, _VOCAB_CHUNK_SIZE):
+        end = min(start + _VOCAB_CHUNK_SIZE, vocab_size)
+        ct = targets[..., start:end].float()
+        cl = logits[..., start:end].float()
+        log_p = ct - log_norm_p.unsqueeze(-1)
+        log_q = cl - log_norm_q.unsqueeze(-1)
+        p = torch.exp(log_p)
+        q = torch.exp(log_q)
+        log_m = torch.logaddexp(log_p, log_q) - math.log(2.0)
+        kl_p_to_m += (p * (log_p - log_m)).sum(dim=-1)
+        kl_q_to_m += (q * (log_q - log_m)).sum(dim=-1)
+    return 0.5 * (kl_p_to_m + kl_q_to_m)
+
+
+def _chunked_ce(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Chunked hard CE: logsumexp(logits) - logits[argmax(targets)].
+
+    Matches original ce_loss which uses argmax(targets) as hard labels.
+    No softmax needed, only gather + chunked logsumexp.
+    """
+    target_ids = torch.argmax(targets, dim=-1)  # [1, seq_len]
+    log_norm_q = _chunked_logsumexp(logits)  # [1, seq_len]
+    target_logits = (
+        logits.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1).float()
+    )  # [1, seq_len]
+    return log_norm_q - target_logits
+
+
+def _chunked_tv(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Chunked TV: 1 - sum_i min(P_i, Q_i)."""
+    log_norm_q = _chunked_logsumexp(logits)
+    log_norm_p = _chunked_logsumexp(targets)
+    overlap = torch.zeros(logits.shape[:2], device=logits.device, dtype=torch.float32)
+    vocab_size = logits.shape[-1]
+    for start in range(0, vocab_size, _VOCAB_CHUNK_SIZE):
+        end = min(start + _VOCAB_CHUNK_SIZE, vocab_size)
+        ct = targets[..., start:end].float()
+        cl = logits[..., start:end].float()
+        p = torch.exp(ct - log_norm_p.unsqueeze(-1))
+        q = torch.exp(cl - log_norm_q.unsqueeze(-1))
+        overlap += torch.minimum(p, q).sum(dim=-1)
+    return 1.0 - overlap
+
+
+def _chunked_nla(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Chunked NLA: -log(alpha) where alpha = sum_i min(P_i, Q_i)."""
+    log_norm_q = _chunked_logsumexp(logits)
+    log_norm_p = _chunked_logsumexp(targets)
+    overlap = torch.zeros(logits.shape[:2], device=logits.device, dtype=torch.float32)
+    vocab_size = logits.shape[-1]
+    for start in range(0, vocab_size, _VOCAB_CHUNK_SIZE):
+        end = min(start + _VOCAB_CHUNK_SIZE, vocab_size)
+        ct = targets[..., start:end].float()
+        cl = logits[..., start:end].float()
+        p = torch.exp(ct - log_norm_p.unsqueeze(-1))
+        q = torch.exp(cl - log_norm_q.unsqueeze(-1))
+        overlap += torch.minimum(p, q).sum(dim=-1)
+    return -torch.log(overlap.clamp_min(_EPS))
+
+
+def _chunked_lk_hybrid(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    eta: float = 3.0,
+) -> torch.Tensor:
+    """Chunked LK hybrid: lambda*KL + (1-lambda)*TV, lambda=exp(-eta*alpha)."""
+    log_norm_q = _chunked_logsumexp(logits)
+    log_norm_p = _chunked_logsumexp(targets)
+    overlap = torch.zeros(logits.shape[:2], device=logits.device, dtype=torch.float32)
+    vocab_size = logits.shape[-1]
+    for start in range(0, vocab_size, _VOCAB_CHUNK_SIZE):
+        end = min(start + _VOCAB_CHUNK_SIZE, vocab_size)
+        ct = targets[..., start:end].float()
+        cl = logits[..., start:end].float()
+        p = torch.exp(ct - log_norm_p.unsqueeze(-1))
+        q = torch.exp(cl - log_norm_q.unsqueeze(-1))
+        overlap += torch.minimum(p, q).sum(dim=-1)
+    tv = 1.0 - overlap
+    kl = _chunked_kl_div(logits, targets)
+    weight = torch.exp(-eta * overlap.detach())
+    return weight * kl + (1.0 - weight) * tv
+
+
+_CHUNKED_BY_NAME: dict[str, Callable[..., torch.Tensor]] = {
+    "kl_div": _chunked_kl_div,
+    "rkl": _chunked_reverse_kl,
+    "jsd": _chunked_jsd,
+    "ce": _chunked_ce,
+    "tv": _chunked_tv,
+    "nla": _chunked_nla,
+    "lk_hybrid": _chunked_lk_hybrid,
+}
+
+
+def _wrap_chunked(loss_config: LossConfig) -> LossConfig:
+    """Replace loss fns in loss_config with chunked versions (DFlash2 only)."""
+    return {
+        name: (_CHUNKED_BY_NAME.get(name, fn), weight)
+        for name, (fn, weight) in loss_config.items()
+    }
+
+
+def _wrap_tv_chunked(tv_loss_fn):
+    """Wrap tv_loss_fn with chunked version."""
+    return _CHUNKED_BY_NAME.get("tv", tv_loss_fn)
 
 
 def selector_training_candidates(
@@ -127,14 +335,16 @@ def compute_metrics(
     dpace_alpha: float = 0.5,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Combine the unary DFlash objective with a K-way selector objective."""
+    chunked_loss_config = _wrap_chunked(loss_config)
+    chunked_tv_loss_fn = _wrap_tv_chunked(tv_loss_fn)
     unary_loss, metrics = compute_unary_metrics(
         unary_logits,
         targets,
         None,
         loss_mask,
         block_size,
-        loss_config=loss_config,
-        tv_loss_fn=tv_loss_fn,
+        loss_config=chunked_loss_config,
+        tv_loss_fn=chunked_tv_loss_fn,
         gamma=gamma,
         confidence_head_alpha=0.0,
         per_position_loss_weight=per_position_loss_weight,
@@ -172,7 +382,7 @@ def compute_metrics(
         ).sum()
         metrics[f"unary_candidate_recall_at_{top_k}_total"] = valid_total
 
-        target_log_normalizer = torch.logsumexp(targets.float(), dim=-1)
+        target_log_normalizer = _chunked_logsumexp(targets)
         candidate_target_logits = targets.gather(-1, training_candidate_ids).float()
         candidate_mass = torch.exp(
             torch.logsumexp(candidate_target_logits, dim=-1) - target_log_normalizer

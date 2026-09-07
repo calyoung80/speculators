@@ -359,6 +359,46 @@ def test_arrow_dataset_retries_nonfinite_read_then_recovers(
     assert arrow_ds.generation_recovery.consecutive_failures == 0
 
 
+def test_arrow_dataset_reserves_generation_token_when_truncating(tmp_path, monkeypatch):
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [list(range(10))],
+            "loss_mask": [[1] * 10],
+            "seq_len": [10],
+        }
+    )
+    ds.save_to_disk(str(tmp_path / "data"))
+    transfer = _SequenceTransfer(
+        [
+            {
+                "hidden_states": torch.ones(7, 2, 4, dtype=torch.bfloat16),
+                "token_ids": torch.arange(7, dtype=torch.long),
+            }
+        ]
+    )
+    arrow_ds = ArrowDataset(
+        max_len=8,
+        datapath=str(tmp_path / "data"),
+        transfer=transfer,  # type: ignore[arg-type]
+        on_missing="generate",
+    )
+    arrow_ds.data.set_format(type="torch")
+    arrow_ds.client = object()  # type: ignore[assignment]
+    arrow_ds.model = "model"
+
+    def generate(_client, _model, client_item, **_kwargs):
+        assert client_item["input_ids"] == list(range(7))
+        return "handle"
+
+    monkeypatch.setattr(data_module, "generate_hidden_states", generate)
+
+    item = arrow_ds[0]
+
+    assert isinstance(item, dict)
+    assert torch.equal(item["input_ids"], torch.arange(7))
+    assert torch.equal(item["loss_mask"], torch.ones(7, dtype=torch.long))
+
+
 def test_exhausted_generation_produces_locally_empty_zero_loss_batch(
     tmp_path, monkeypatch, caplog
 ):

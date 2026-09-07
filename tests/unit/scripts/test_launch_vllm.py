@@ -23,9 +23,11 @@ def test_defaults_added_when_absent():
     ]
 
 
-def test_explicit_flag_follows_default():
-    args = _with_render_defaults(["--api-server-count", "1"])
-    assert args[-2:] == ["--api-server-count", "1"]
+def test_explicit_flags_are_not_duplicated():
+    args = _with_render_defaults(
+        ["--api-server-count", "1", "--renderer-num-workers=1"]
+    )
+    assert args == ["--api-server-count", "1", "--renderer-num-workers=1"]
 
 
 def test_headless_does_not_get_api_server_defaults():

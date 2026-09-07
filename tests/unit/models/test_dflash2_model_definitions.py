@@ -8,13 +8,15 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from speculators import SpeculatorModelConfig, SpeculatorsConfig, VerifierConfig
 from speculators.losses import resolve_loss_config
+from speculators.losses.eager import kl_div_loss
 from speculators.models.dflash2 import DFlash2DraftModel, DFlash2SpeculatorConfig
 from speculators.models.dflash2.metrics import (
-    compute_metrics as compute_dflash2_metrics,
-)
-from speculators.models.dflash2.metrics import (
+    _chunked_kl_div,
     compute_selector_loss,
     selector_training_candidates,
+)
+from speculators.models.dflash2.metrics import (
+    compute_metrics as compute_dflash2_metrics,
 )
 from speculators.models.dflash2.model_definitions import (
     CandidateSelector,
@@ -78,6 +80,27 @@ def test_grouped_dynamic_conv_matches_scalar_reference():
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_chunked_kl_matches_eager_values_and_gradients():
+    """Chunked KL must match the eager reference across multiple vocab chunks."""
+    torch.manual_seed(0)
+    logits = torch.randn(1, 3, 16_385, dtype=torch.float32, requires_grad=True)
+    targets = torch.randn(1, 3, 16_385, dtype=torch.float32, requires_grad=True)
+
+    eager_loss = kl_div_loss(logits, targets)
+    eager_loss.sum().backward()
+    eager_logits_grad = logits.grad.clone()
+    eager_targets_grad = targets.grad.clone()
+
+    logits.grad = None
+    targets.grad = None
+    chunked_loss = _chunked_kl_div(logits, targets)
+    chunked_loss.sum().backward()
+
+    torch.testing.assert_close(chunked_loss, eager_loss, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(logits.grad, eager_logits_grad, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(targets.grad, eager_targets_grad, atol=1e-6, rtol=1e-5)
 
 
 def test_grouped_dynamic_conv_does_not_cross_block_boundaries():

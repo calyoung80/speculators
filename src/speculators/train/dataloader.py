@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -121,6 +122,13 @@ def create_train_val_loaders(
     if not (0.0 < train_data_ratio < 1.0):
         raise ValueError(f"train_data_ratio must be in (0, 1), got {train_data_ratio}")
 
+    # A local verifier path is not the model identifier served by vLLM. Let the
+    # dataset discover the endpoint's model ID instead of sending a filesystem
+    # path in each OpenAI completion request.
+    served_model = (
+        None if Path(verifier_name_or_path).is_dir() else verifier_name_or_path
+    )
+
     train_dataset: BaseDataset = ArrowDataset(
         datapath=data_path,
         max_len=total_seq_len,
@@ -131,7 +139,7 @@ def create_train_val_loaders(
         transform=noise_transform,
         train_ratio=train_data_ratio,
         split="train",
-        model=verifier_name_or_path,
+        model=served_model,
         hidden_states_dtype=hidden_states_dtype,
         request_timeout=request_timeout,
         max_retries=max_retries,
@@ -147,7 +155,7 @@ def create_train_val_loaders(
         on_generate=on_generate,
         train_ratio=train_data_ratio,
         split="val",
-        model=verifier_name_or_path,
+        model=served_model,
         hidden_states_dtype=hidden_states_dtype,
         request_timeout=request_timeout,
         max_retries=max_retries,

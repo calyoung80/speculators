@@ -1,8 +1,8 @@
-from contextlib import nullcontext
 import json
 import logging
 import time
 import warnings
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -155,7 +155,9 @@ def _resolve_scheduler_steps(
     default of 1% of the resolved total steps. ``scheduler_total_steps`` defaults
     to ``num_epochs * train_loader_len``.
     """
-    default_total_steps = (config.num_epochs * train_loader_len) // max(config.gradient_accumulation_steps, 1)
+    default_total_steps = (config.num_epochs * train_loader_len) // max(
+        config.gradient_accumulation_steps, 1
+    )
     scheduler_total_steps = (
         config.scheduler_total_steps
         if config.scheduler_total_steps is not None
@@ -500,7 +502,9 @@ class Trainer:
             timer.mark("fwd")
 
             grad_accum = self.config.gradient_accumulation_steps
-            is_sync_step = (local_step_rel % grad_accum == 0) or (local_step_rel == num_steps)
+            is_sync_step = (local_step_rel % grad_accum == 0) or (
+                local_step_rel == num_steps
+            )
             sync_context = nullcontext() if is_sync_step else self.model.no_sync()
 
             with sync_context:
@@ -535,9 +539,17 @@ class Trainer:
             if timer.enabled:
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
                 profile = timer.profile(num_tokens)
-                if self.is_distributed:
-                    for v in metrics.values():
-                        dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
+                if self.is_distributed and metrics:
+                    # Reduce one stable FP32 vector rather than issuing one
+                    # collective per dict entry. Dynamic metric construction
+                    # can otherwise make ranks enter the HCCL collectives in
+                    # different orders and deadlock at epoch end.
+                    metric_names = sorted(metrics)
+                    reduced_metrics = torch.stack(
+                        [metrics[name].detach().float() for name in metric_names]
+                    )
+                    dist.reduce(reduced_metrics, dst=0, op=dist.ReduceOp.SUM)
+                    metrics = dict(zip(metric_names, reduced_metrics, strict=True))
 
                 metrics = {k: v.item() for k, v in metrics.items()}
                 world_size = dist.get_world_size() if self.is_distributed else 1

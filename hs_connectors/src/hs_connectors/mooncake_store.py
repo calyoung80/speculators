@@ -129,6 +129,7 @@ class MooncakeHiddenStatesStore:
 
         try:
             import torch_npu  # noqa: F401 # noqa: PLC0415
+
             if torch.npu.is_available():
                 try:
                     torch.npu.set_device(torch.npu.current_device())
