@@ -26,6 +26,7 @@ PRODUCER_HOST=${1:-71.10.29.118}
 PRODUCER_PORT=${2:-18000}
 CONSUMER_NPUS=${3:-2,3}
 LOCAL_HOST_IP=${4:-71.10.29.119}
+NPROC_PER_NODE=${NPROC_PER_NODE:-2}
 RUN_ID=$(date +%Y%m%d_%H%M%S)
 SAVE_PATH=${SAVE_PATH:-/mnt/hcs/y00917737/dflash2_cross_node_smoke_ckpt/${RUN_ID}}
 RUN_NAME=${RUN_NAME:-dflash2_cross_node_${RUN_ID}}
@@ -39,6 +40,7 @@ TRAIN_DATA_RATIO=${TRAIN_DATA_RATIO:-0.9}
 FSDP_SHARD=${FSDP_SHARD:-0}
 CHECKPOINT_STEP_INTERVAL=${CHECKPOINT_STEP_INTERVAL:-0}
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-0}
+DRAFT_CONFIG=${DRAFT_CONFIG:-/mnt/hcs/y00917737/dflash2_draft_config}
 export TE_META_DIR
 
 FSDP_ARGS=()
@@ -79,11 +81,12 @@ printf 'producer=%s:%s consumer_npus=%s master_port=%s hccl_intra_roce=unset\n' 
 python3 -c "from transformers import AutoConfig; AutoConfig.from_pretrained('${VERIFIER_PATH}')" \
   >> /tmp/dflash2_cross_node_train.log 2>&1
 
-exec torchrun --nproc_per_node=2 --nnodes=1 \
+exec torchrun --nproc_per_node="${NPROC_PER_NODE}" --nnodes=1 \
   --master-addr "${MASTER_ADDR}" --master-port "${MASTER_PORT}" \
   scripts/train.py \
   --speculator-type dflash2 \
   --verifier-name-or-path "${VERIFIER_PATH}" \
+  --draft-config "${DRAFT_CONFIG}" \
   --data-path "${DATA_PATH}" \
   --hidden-states-backend mooncake-te \
   --mooncake-te-zmq-port 9999 \
@@ -110,13 +113,12 @@ exec torchrun --nproc_per_node=2 --nnodes=1 \
   --save-path "${SAVE_PATH}" \
   "${RESUME_ARGS[@]}" \
   --draft-attn-impl sdpa \
-  --draft-arch qwen3 \
   --dflash-decay-gamma 4.0 \
   --conv-kernel-size 2 \
   --selector-rank 256 \
   --selector-top-k 16 \
-  --num-workers 0 \
+  --num-workers ${NUM_WORKERS:-0} \
   --prefetch-factor 2 \
   --request-timeout 600 \
   --run-name "${RUN_NAME}" \
-  >> /tmp/dflash2_cross_node_train.log 2>&1
+  >> /tmp/dflash2_cro

@@ -5,17 +5,21 @@ set -euo pipefail
 
 PASS=${D2_SSH_PASSWORD:?Set D2_SSH_PASSWORD before running this script}
 USER=test_mtp
-PRODUCER_HOST=71.10.29.118
-CONSUMER_HOST=71.10.29.119
-PRODUCER_PORT=18000
-PRODUCER_CONTAINER=dflash2_roce_producer_118
-CONSUMER_CONTAINER=dflash2_train
+PRODUCER_HOST=${PRODUCER_HOST:-71.10.29.118}
+CONSUMER_HOST=${CONSUMER_HOST:-71.10.29.119}
+PRODUCER_PORT=${PRODUCER_PORT:-18000}
+PRODUCER_CONTAINER=${PRODUCER_CONTAINER:-dflash2_roce_producer_118}
+CONSUMER_CONTAINER=${CONSUMER_CONTAINER:-dflash2_train}
+PRODUCER_NPUS=${PRODUCER_NPUS:-1,2}
+PRODUCER_TP_SIZE=${PRODUCER_TP_SIZE:-2}
 REPO=/mnt/hcs/y00917737/te_dspark_submission/speculators
 PRODUCER_LOG=/tmp/dflash2_roce_producer.log
 TRAIN_LOG=/tmp/dflash2_cross_node_train.log
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 MODEL_PATH=${MODEL_PATH:-/mnt/share/weight/Qwen/Qwen3.8-27B}
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-2}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.80}
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-${MAX_MODEL_LEN}}
 TOTAL_SEQ_LEN=${TOTAL_SEQ_LEN:-4096}
 MAX_ANCHORS=${MAX_ANCHORS:-64}
 MAX_STEPS=${MAX_STEPS:-1}
@@ -27,6 +31,12 @@ DATA_PATH=${DATA_PATH:-}
 SAVE_PATH=${SAVE_PATH:-}
 RUN_NAME=${RUN_NAME:-}
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-0}
+EXPECTED_IMAGE_ID=${EXPECTED_IMAGE_ID:-sha256:866eda94f03689eebe48247d3683515fe4f0b6a81628fc8741788b519f501222}
+IMAGE=${IMAGE:-quay.io/ascend/vllm-ascend@sha256:866eda94f03689eebe48247d3683515fe4f0b6a81628fc8741788b519f501222}
+DRAFT_CONFIG=${DRAFT_CONFIG:-/mnt/hcs/y00917737/dflash2_draft_config}
+TE_META_DIR=${TE_META_DIR:-/mnt/hcs/y00917737/dflash2_te_meta_118_119}
+CONSUMER_NPUS=${CONSUMER_NPUS:-2,3}
+NPROC_PER_NODE=${NPROC_PER_NODE:-2}
 
 remote() {
   sshpass -p "${PASS}" ssh \
@@ -37,9 +47,59 @@ remote() {
     "${USER}@$1" "${2}" 2>/dev/null
 }
 
+# 启动训练前先核对两端真实镜像身份。
+# `nightly-main` 是浮动 tag；即使两端显示同一个 tag，实际的 Ubuntu/CANN/
+# Python/vLLM 层也可能不同。Docker container 的 Image ID 才是可比较的版本身份。
+check_container_images() {
+  local producer_ref producer_id consumer_ref consumer_id producer_meta consumer_meta
+
+  producer_ref=$(remote "${PRODUCER_HOST}" \
+    "docker inspect --type=container --format '{{.Config.Image}}' ${PRODUCER_CONTAINER}") || {
+    echo "ERROR: producer container ${PRODUCER_CONTAINER} is missing on ${PRODUCER_HOST}" >&2
+    return 1
+  }
+  producer_id=$(remote "${PRODUCER_HOST}" \
+    "docker inspect --type=container --format '{{.Image}}' ${PRODUCER_CONTAINER}") || return 1
+  consumer_ref=$(remote "${CONSUMER_HOST}" \
+    "docker inspect --type=container --format '{{.Config.Image}}' ${CONSUMER_CONTAINER}") || {
+    echo "ERROR: training container ${CONSUMER_CONTAINER} is missing on ${CONSUMER_HOST}" >&2
+    return 1
+  }
+  consumer_id=$(remote "${CONSUMER_HOST}" \
+    "docker inspect --type=container --format '{{.Image}}' ${CONSUMER_CONTAINER}") || return 1
+
+  producer_meta=$(remote "${PRODUCER_HOST}" \
+    "docker image inspect --format '{{.Created}}|{{.Os}}|{{index .Config.Labels \"org.opencontainers.image.version\"}}' '${producer_ref}'" \
+    || true)
+  consumer_meta=$(remote "${CONSUMER_HOST}" \
+    "docker image inspect --format '{{.Created}}|{{.Os}}|{{index .Config.Labels \"org.opencontainers.image.version\"}}' '${consumer_ref}'" \
+    || true)
+
+  echo "=== IMAGE PREFLIGHT ==="
+  echo "producer ${PRODUCER_HOST}/${PRODUCER_CONTAINER}: ref=${producer_ref} id=${producer_id} meta=${producer_meta:-unknown}"
+  echo "training ${CONSUMER_HOST}/${CONSUMER_CONTAINER}: ref=${consumer_ref} id=${consumer_id} meta=${consumer_meta:-unknown}"
+
+  if [ "${producer_id}" != "${consumer_id}" ]; then
+    echo "ERROR: producer/training image IDs differ; refusing to start training." >&2
+    echo "Load/tag one immutable image on both hosts, then rerun." >&2
+    return 1
+  fi
+  if [ -n "${EXPECTED_IMAGE_ID}" ] && [ "${producer_id}" != "${EXPECTED_IMAGE_ID}" ]; then
+    echo "ERROR: image ID ${producer_id} does not match EXPECTED_IMAGE_ID=${EXPECTED_IMAGE_ID}." >&2
+    return 1
+  fi
+  echo "Image preflight passed: both containers use ${producer_id}."
+}
+
 check_producer_npu() {
-  remote "${PRODUCER_HOST}" \
-    "npu-smi info | grep 'No running processes found in NPU 1' && npu-smi info | grep 'No running processes found in NPU 2'"
+  local producer_npu
+  for producer_npu in ${PRODUCER_NPUS//,/ }; do
+    if ! remote "${PRODUCER_HOST}" \
+      "npu-smi info | grep -q 'No running processes found in NPU ${producer_npu}'"; then
+      echo "Producer NPU ${producer_npu} is not free on ${PRODUCER_HOST}." >&2
+      return 1
+    fi
+  done
 }
 
 check_producer_port() {
@@ -60,12 +120,12 @@ prepare_producer() {
   check_producer_npu
   check_producer_port
   remote "${PRODUCER_HOST}" \
-    "cd ${REPO} && bash deploy/create_container_dflash2.sh ${PRODUCER_CONTAINER} 1,2"
+    "cd ${REPO} && bash deploy/create_container_dflash2.sh ${PRODUCER_CONTAINER} ${PRODUCER_NPUS}"
 }
 
 start_producer() {
   remote "${PRODUCER_HOST}" \
-    "docker exec ${PRODUCER_CONTAINER} sh -c 'rm -rf /mnt/hcs/y00917737/dflash2_te_meta_118_119 && mkdir -p /mnt/hcs/y00917737/dflash2_te_meta_118_119' && docker exec -d -e MODEL_PATH=${MODEL_PATH} -e MAX_MODEL_LEN=${MAX_MODEL_LEN} -e MAX_NUM_BATCHED_TOKENS=${MAX_MODEL_LEN} -e MAX_NUM_SEQS=${MAX_NUM_SEQS} ${PRODUCER_CONTAINER} bash ${REPO}/deploy/start_vllm_te.sh 1,2 2 ${PRODUCER_PORT} ${PRODUCER_HOST}"
+    "docker exec ${PRODUCER_CONTAINER} sh -c 'rm -rf ${TE_META_DIR} && mkdir -p ${TE_META_DIR}' && docker exec -d -e MODEL_PATH=${MODEL_PATH} -e MAX_MODEL_LEN=${MAX_MODEL_LEN} -e MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS} -e MAX_NUM_SEQS=${MAX_NUM_SEQS} -e GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION} -e TE_META_DIR=${TE_META_DIR} ${PRODUCER_CONTAINER} bash ${REPO}/deploy/start_vllm_te.sh ${PRODUCER_NPUS} ${PRODUCER_TP_SIZE} ${PRODUCER_PORT} ${PRODUCER_HOST}"
 }
 
 wait_for_producer() {
@@ -99,6 +159,7 @@ stop_stale_training() {
 }
 
 start_training() {
+  check_container_images
   if remote "${CONSUMER_HOST}" \
     "docker exec ${CONSUMER_CONTAINER} pgrep -f 'scripts/train.py.*dflash2_qwen38_500k_8k_fsdp_' >/dev/null"; then
     echo "A formal DFlash2 run is already active; refusing to start another training job." >&2
@@ -106,7 +167,7 @@ start_training() {
   fi
   stop_stale_training
   remote "${CONSUMER_HOST}" \
-    "docker exec -d -e TOTAL_SEQ_LEN=${TOTAL_SEQ_LEN} -e MAX_ANCHORS=${MAX_ANCHORS} -e MAX_STEPS=${MAX_STEPS} -e EPOCHS=${EPOCHS} -e TRAIN_DATA_RATIO=${TRAIN_DATA_RATIO} -e FSDP_SHARD=${FSDP_SHARD} -e CHECKPOINT_STEP_INTERVAL=${CHECKPOINT_STEP_INTERVAL} -e DATA_PATH=${DATA_PATH} -e SAVE_PATH=${SAVE_PATH} -e RUN_NAME=${RUN_NAME} -e RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT} ${CONSUMER_CONTAINER} bash ${REPO}/deploy/start_train_te_dflash2.sh ${PRODUCER_HOST} ${PRODUCER_PORT} 2,3 ${CONSUMER_HOST}; for _ in 1 2 3 4 5 6; do docker exec ${CONSUMER_CONTAINER} pgrep -af '[s]cripts/train.py' && exit 0; sleep 5; done; docker exec ${CONSUMER_CONTAINER} cat ${TRAIN_LOG}; exit 1"
+    "docker exec -d -e TOTAL_SEQ_LEN=${TOTAL_SEQ_LEN} -e MAX_ANCHORS=${MAX_ANCHORS} -e MAX_STEPS=${MAX_STEPS} -e EPOCHS=${EPOCHS} -e TRAIN_DATA_RATIO=${TRAIN_DATA_RATIO} -e FSDP_SHARD=${FSDP_SHARD} -e CHECKPOINT_STEP_INTERVAL=${CHECKPOINT_STEP_INTERVAL} -e DATA_PATH=${DATA_PATH} -e SAVE_PATH=${SAVE_PATH} -e RUN_NAME=${RUN_NAME} -e RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT} -e TE_META_DIR=${TE_META_DIR} -e CONSUMER_NPUS=${CONSUMER_NPUS} -e NPROC_PER_NODE=${NPROC_PER_NODE} -e DRAFT_CONFIG=${DRAFT_CONFIG} ${CONSUMER_CONTAINER} bash ${REPO}/deploy/start_train_te_dflash2.sh ${PRODUCER_HOST} ${PRODUCER_PORT} ${CONSUMER_NPUS} ${CONSUMER_HOST}; for _ in 1 2 3 4 5 6; do docker exec ${CONSUMER_CONTAINER} pgrep -af '[s]cripts/train.py' && exit 0; sleep 5; done; docker exec ${CONSUMER_CONTAINER} cat ${TRAIN_LOG}; exit 1"
 }
 
 sync_verifier() {
@@ -175,6 +236,9 @@ case ${1:-smoke} in
   status-training)
     status_training
     ;;
+  check-images)
+    check_container_images
+    ;;
   reset-consumer)
     stop_stale_training
     ;;
@@ -188,7 +252,7 @@ case ${1:-smoke} in
     status
     ;;
   *)
-    echo "Usage: $0 {prepare-producer|start-producer|wait-producer|sync-verifier|start-training|wait-training|status|status-training|reset-consumer|smoke}" >&2
+    echo "Usage: $0 {prepare-producer|start-producer|wait-producer|sync-verifier|start-training|wait-training|status|status-training|reset-consumer|check-images|smoke}" >&2
     exit 2
     ;;
 esac

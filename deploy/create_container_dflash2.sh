@@ -1,7 +1,8 @@
 #!/bin/bash
 # ============================================================
 # DFlash2 训练容器创建脚本
-# 镜像: quay.nju.edu.cn/ascend/vllm-ascend:nightly-main
+# 镜像: 默认使用 quay.io/ascend/vllm-ascend@sha256:866eda94f03689eebe48247d3683515fe4f0b6a81628fc8741788b519f501222。
+# 跨机任务不能仅凭浮动 tag 判断版本，必须核对相同 immutable Image ID。
 # 关键: --ipc=host (修复 Mooncake TE ADXL rtsIpcMemGetExportKey 失败)
 #
 # 用法:
@@ -12,7 +13,8 @@ set -euxo pipefail
 
 CONTAINER_NAME=${1:-dflash2_train}
 NPU_IDS=${2:-0,1,2,3,4,5,6,7}
-IMAGE=quay.nju.edu.cn/ascend/vllm-ascend:nightly-main
+IMAGE=${IMAGE:-quay.io/ascend/vllm-ascend@sha256:866eda94f03689eebe48247d3683515fe4f0b6a81628fc8741788b519f501222}
+EXPECTED_IMAGE_ID=${EXPECTED_IMAGE_ID:-}
 
 DEVICES=()
 for NPU_ID in ${NPU_IDS//,/ }; do
@@ -34,8 +36,7 @@ docker run -itd \
   --network=host \
   --shm-size=8g \
   "${DEVICES[@]}" \
-  -v /mnt/hcs:/mnt/hcs \
-  -v /mnt/share/weight:/mnt/share/weight:ro \
+  -v /mnt:/mnt \
   -v /usr/local/dcmi:/usr/local/dcmi \
   -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
   -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
@@ -45,9 +46,8 @@ docker run -itd \
   -e VLLM_PLUGINS=ascend \
   -e PYTORCH_NPU_ALLOC_CONF=expandable_segments:True \
   -e HF_HOME=/mnt/hcs/cache/huggingface \
-  --entrypoint /bin/bash \
   ${IMAGE} \
-  -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh && source /usr/local/Ascend/cann-9.1.0/share/info/ascendnpu-ir/bin/set_env.sh && source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1 && exec sleep infinity"
+  sleep infinity
 
 sleep 3
 
@@ -61,6 +61,17 @@ pip install datasets multiprocess pyarrow pyarrow-hotfix 2>&1 | tail -3
 echo ""
 echo "Container ${CONTAINER_NAME} ready."
 echo "  NPU: ${NPU_IDS}"
+ACTUAL_IMAGE_ID=$(docker inspect ${CONTAINER_NAME} --format '{{.Image}}')
+IMAGE_CREATED=$(docker image inspect "${IMAGE}" --format '{{.Created}}' 2>/dev/null || echo unknown)
+IMAGE_OS=$(docker image inspect "${IMAGE}" --format '{{.Os}}' 2>/dev/null || echo unknown)
+echo "  image: ${IMAGE}"
+echo "  image_id: ${ACTUAL_IMAGE_ID}"
+echo "  image_created: ${IMAGE_CREATED}"
+echo "  image_os: ${IMAGE_OS}"
+if [ -n "${EXPECTED_IMAGE_ID}" ] && [ "${ACTUAL_IMAGE_ID}" != "${EXPECTED_IMAGE_ID}" ]; then
+  echo "ERROR: image ID mismatch: expected ${EXPECTED_IMAGE_ID}, got ${ACTUAL_IMAGE_ID}" >&2
+  exit 1
+fi
 echo "  IPC: $(docker inspect ${CONTAINER_NAME} --format '{{.HostConfig.IpcMode}}')"
 echo "  shm: $(docker exec ${CONTAINER_NAME} df -h /dev/shm | tail -1 | awk '{print $2}')"
 echo "  npu: $(docker exec ${CONTAINER_NAME} npu-smi info 2>/dev/null | grep '910B3' | wc -l) x 910B3"

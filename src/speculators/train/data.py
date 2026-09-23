@@ -1,6 +1,9 @@
+import fcntl
 import logging
+import time
 import warnings
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -28,6 +31,17 @@ from speculators.train.recovery import (
 
 BatchType = dict[str, Any]
 logger = logging.getLogger("speculators")
+
+_ONLINE_GENERATION_LOCK = Path("/tmp/speculators-online-hidden-state-generation.lock")
+
+@contextmanager
+def _online_generation_lock():
+    with _ONLINE_GENERATION_LOCK.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def create_empty_sample(
@@ -243,9 +257,11 @@ class ArrowDataset(BaseDataset):
         client_item: ClientItem,
     ) -> dict[str, torch.Tensor]:
         handle: str | None = None
+        round_trip_start = time.perf_counter()
         try:
             if not self.client:
                 self._setup_client()
+            http_start = time.perf_counter()
             handle = generate_hidden_states(
                 self.client,  # type:ignore[arg-type]
                 self.model,  # type:ignore[arg-type]
@@ -253,8 +269,11 @@ class ArrowDataset(BaseDataset):
                 timeout=self.request_timeout,
                 max_retries=self.max_retries,
             )
+            http_ms = (time.perf_counter() - http_start) * 1000
 
+            transfer_start = time.perf_counter()
             loaded_hs = self.transfer.get_generated(handle)
+            transfer_ms = (time.perf_counter() - transfer_start) * 1000
             if loaded_hs is None:
                 raise ValueError(f"Failed to load hidden states for handle {handle}")
 
@@ -262,9 +281,12 @@ class ArrowDataset(BaseDataset):
             # transfer performs manifest/checksum validation first.
             _ids = dataset_item["input_ids"]
             _ids = _ids if isinstance(_ids, list) else _ids.tolist()
+            validation_start = time.perf_counter()
             check_hidden_states(loaded_hs, _ids)
+            validation_ms = (time.perf_counter() - validation_start) * 1000
 
             file_idx = self._map_to_file_idx(index)
+            cleanup_start = time.perf_counter()
             if self.on_generate == "cache":
                 self.transfer.cache(handle, file_idx)
             else:
@@ -277,6 +299,19 @@ class ArrowDataset(BaseDataset):
                         handle,
                         cleanup_error,
                     )
+            cleanup_ms = (time.perf_counter() - cleanup_start) * 1000
+            logger.info(
+                "hidden_state_stages index=%d handle=%s http_ms=%.2f "
+                "transfer_ms=%.2f validation_ms=%.2f cleanup_ms=%.2f "
+                "round_trip_ms=%.2f",
+                index,
+                handle,
+                http_ms,
+                transfer_ms,
+                validation_ms,
+                cleanup_ms,
+                (time.perf_counter() - round_trip_start) * 1000,
+            )
             return loaded_hs
         except Exception:
             if handle is not None:
@@ -308,17 +343,18 @@ class ArrowDataset(BaseDataset):
                         :request_max_len
                     ]
                 client_item = build_client_item(dataset_item)
-                loaded_hs = self.generation_recovery.run(
-                    lambda: self._generate_hidden_states_once(
-                        index,
-                        dataset_item,
-                        client_item,
-                    ),
-                    description=(
-                        f"Hidden-state round trip failed for dataset index {index}, "
-                        f"file index {file_idx}"
-                    ),
-                )
+                with _online_generation_lock():
+                    loaded_hs = self.generation_recovery.run(
+                        lambda: self._generate_hidden_states_once(
+                            index,
+                            dataset_item,
+                            client_item,
+                        ),
+                        description=(
+                            f"Hidden-state round trip failed for dataset index {index}, "
+                            f"file index {file_idx}"
+                        ),
+                    )
             elif self.on_missing == "skip":
                 return SampleUnavailable()
             elif self.on_missing == "warn":

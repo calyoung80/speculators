@@ -157,9 +157,9 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._request_keys: dict[str, str] = {}
         self._pending_saves: dict[str, PendingSave] = {}
 
-        # ACK sync: track previous request key to prevent KV cache block
-        # overwrite before consumer has read via TE transfer.
-        self._prev_te_key: str | None = None
+        # Each publication owns a non-overlapping range of the registered send
+        # buffer until its Consumer ACK is observed.
+        self._pending_te_leases: list[tuple[str, str]] = []
 
         self._kv_cache: torch.Tensor | None = None
         self._is_tp_rank_zero: bool = True
@@ -183,42 +183,48 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     # ==============================
 
     def start_load_kv(self, *args: Any, **kwargs: Any) -> None:
-        if self._store_ready and self._store._send_hs_buffer is not None:
+        if not self._store_ready:
+            return
+        self._release_acked_leases()
+        if not self._pending_te_leases and self._store._send_hs_buffer is not None:
             self._store.reset_send_buffer()
 
-        # ACK sync: wait for previous request's ACK before this request's
-        # unified_kv_cache_update overwrites KV cache blocks.
-        prev_key = self._prev_te_key
-        if prev_key is not None and self._store_ready:
+    def _release_acked_leases(self) -> None:
+        remaining = []
+        for key, generation in self._pending_te_leases:
             try:
-                meta = self._get_connector_metadata()
-                has_new = hasattr(meta, "requests") and meta.requests
-            except Exception:
-                has_new = False
-            if has_new:
-                meta_dir = os.environ.get("TE_META_DIR", "/tmp/te_meta")
-                prev_meta = os.path.join(meta_dir, f"{prev_key}.json")
-                if not os.path.exists(prev_meta):
-                    self._prev_te_key = None
-                else:
-                    ack_path = os.path.join(meta_dir, f"{prev_key}.ack")
-                    t0 = time.perf_counter()
-                    ack_timeout = float(os.environ.get("TE_ACK_TIMEOUT", "5"))
-                    while not os.path.exists(ack_path):
-                        if time.perf_counter() - t0 > ack_timeout:
-                            logger.warning(
-                                "ACK timeout for prev_key=%s after %.1fs",
-                                prev_key,
-                                ack_timeout,
-                            )
-                            break
-                        time.sleep(0.01)
-                    else:
-                        try:
-                            os.remove(ack_path)
-                        except OSError:
-                            pass
-                    self._prev_te_key = None
+                self._store.wait_for_ack(key, generation, timeout=0.0)
+                self._store.release_sample(key, generation)
+                logger.warning(
+                    "ack_release key=%s generation=%s pending=%d",
+                    key,
+                    generation,
+                    len(self._pending_te_leases) - 1,
+                )
+            except TimeoutError:
+                remaining.append((key, generation))
+            except (OSError, RuntimeError) as exc:
+                logger.error(
+                    "TE lease remains pending key=%s generation=%s: %s",
+                    key,
+                    generation,
+                    exc,
+                )
+                remaining.append((key, generation))
+        self._pending_te_leases = remaining
+
+    def _wait_for_send_capacity(self, num_tokens: int) -> None:
+        if self._store.has_send_capacity(self._kv_cache, num_tokens):
+            return
+        wait_started = time.perf_counter()
+        while self._pending_te_leases:
+            self._release_acked_leases()
+            if self._pending_te_leases:
+                time.sleep(0.01)
+        self._store.reset_send_buffer()
+        logger.warning(
+            "send_buffer_reset wait_ms=%.2f", (time.perf_counter() - wait_started) * 1000
+        )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
@@ -303,6 +309,7 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _write_sample(self, pending: PendingSave) -> None:
         num_tokens = len(pending.token_ids)
+        self._wait_for_send_capacity(num_tokens)
         ptr, size, shape = self._store.copy_to_send_buffer(
             self._kv_cache, pending.slot_mapping, num_tokens
         )
@@ -330,8 +337,8 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             "dtype": str(pending.token_ids.dtype),
         }
 
-        self._store.put_sample(pending.te_key, tensor_specs)
-        self._prev_te_key = pending.te_key
+        generation = self._store.put_sample(pending.te_key, tensor_specs)
+        self._pending_te_leases.append((pending.te_key, generation))
 
     def get_finished(
         self, finished_req_ids: set[str]

@@ -78,6 +78,17 @@ The evaluation startup guard was exercised while training was active and
 correctly refused to launch. Post-training evaluation remains additionally
 blocked by the missing vLLM DFlash2 serving registration described above.
 
+See `MULTI_PRODUCER_TRAINER_ANALYSIS.md` for the analysis based on the actual
+runtime repository at `/mnt/hcs/y00917737/te_dspark_submission/speculators`,
+including the current synchronous training fetch path, Mermaid flow diagrams,
+upstream PR comparison, and the staged implementation plan for async prefetch,
+multi-node Trainer, and eventual multi-Producer routing.
+
+See `SCALING_DESIGN.md` for the detailed implementation design: community PR
+mapping, current and target flow diagrams, `ProducerPool`,
+`PrefetchScheduler`, TE lease/metadata contracts, metrics, multi-node launcher
+parameters, night/day profiles, and the T0-T4 acceptance matrix.
+
 See `../CROSS_NODE_ROCE_DFLASH2.md` for the full diagnostic history and
 numerical validation results.
 
