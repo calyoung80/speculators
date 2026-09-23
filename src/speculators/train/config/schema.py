@@ -435,6 +435,14 @@ class TrainerArgs(_Group):
         "activation memory at the cost of ~30-50 percent slower backward. "
         "Recommended for 32K+ sequence lengths or large max_anchors.",
     )
+    global_token_norm: bool = Field(
+        default=False,
+        description="Normalize training gradients by the globally reduced token "
+        "count (one extra small all-reduce per step) instead of per-rank means, "
+        "so token-poor DDP ranks no longer contribute oversized gradients. "
+        "Changes training dynamics vs the legacy behavior; keep off for exact "
+        "comparability with earlier runs.",
+    )
     max_steps: int | None = Field(
         default=None,
         ge=1,

@@ -98,6 +98,10 @@ def compute_metrics(
         if token_count is not None
         else ones
     )
+    if token_count is not None:
+        # Live token count for the trainer's gradient-normalization
+        # all-reduce (popped before metric reduction; see trainer.py).
+        metrics["__loss_token_count__"] = token_count.to(logits.device)
     for term_name, term_val in term_losses.items():
         metrics[f"{term_name}_sum"] = term_val
         metrics[f"{term_name}_total"] = ones.clone()

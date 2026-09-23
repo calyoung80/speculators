@@ -14,7 +14,10 @@ from speculators.losses import LossConfig, resolve_loss_config
 from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.attention import create_float_mask
 from speculators.models.dflash import DFlashSpeculatorConfig
-from speculators.models.dflash.attention import create_anchor_block_mask_mod
+from speculators.models.dflash.attention import (
+    build_anchor_block_float_mask,
+    create_anchor_block_mask_mod,
+)
 from speculators.models.dflash.metrics import compute_metrics
 from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
 from speculators.models.dflash.utils import (
@@ -336,21 +339,39 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         sliding_window: int | None = None,
         sliding_window_non_causal: bool = False,
     ):
-        mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
+        if self._attn_impl == "simple_flex_attention":
+            mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
+                document_ids=document_ids.squeeze(0).to(device),
+                total_seq_len=total_seq_len,
+                anchor_positions=anchor_positions,
+                block_size=self.block_size,
+                sliding_window=sliding_window,
+                sliding_window_non_causal=sliding_window_non_causal,
+            )
+            return self._create_mask_fn(
+                mask_mod,
+                B=None,
+                H=None,
+                Q_LEN=q_len,
+                KV_LEN=kv_len,
+                device=device,
+            )
+        # Dense mask path (eager / SDPA). flex_attention.create_mask routes
+        # the mask mod through _vmap_for_bhqkv (vmap/compile chain), which has
+        # no working backend on Ascend NPU (runtime error 207001). Use the
+        # pure-broadcasting builder instead - numerically identical (unit
+        # tested against the flex reference), zero vmap dependency.
+        return build_anchor_block_float_mask(
             document_ids=document_ids.squeeze(0).to(device),
             total_seq_len=total_seq_len,
             anchor_positions=anchor_positions,
             block_size=self.block_size,
             sliding_window=sliding_window,
             sliding_window_non_causal=sliding_window_non_causal,
-        )
-        return self._create_mask_fn(
-            mask_mod,
-            B=None,
-            H=None,
-            Q_LEN=q_len,
-            KV_LEN=kv_len,
-            device=device,
+            dtype=getattr(
+                self.config.transformer_layer_config, "dtype", None
+            )
+            or torch.bfloat16,
         )
 
     @torch.compiler.disable

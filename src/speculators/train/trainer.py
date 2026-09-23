@@ -161,6 +161,7 @@ class TrainerConfig(NamedTuple):
     gradient_checkpointing: bool = False
     max_steps: int | None = None
     gradient_accumulation_steps: int = 1
+    global_token_norm: bool = False
 
 
 def _resolve_scheduler_steps(
@@ -553,6 +554,28 @@ class Trainer:
             sync_context = nullcontext() if is_sync_step else self.model.no_sync()
 
             with sync_context:
+                # Global token normalization for gradients: each rank currently
+                # holds L_r = S_r / N_r (per-rank mean). DDP averages gradients
+                # across ranks, so token-poor ranks would otherwise contribute
+                # disproportionately large gradients (observed ~12x p50 token
+                # imbalance between ranks on multipack batches). Rescale to
+                # L_r * (N_r * R / N_total) so the DDP average equals the
+                # gradient of the global token-weighted loss sum(S)/sum(N).
+                # Requires one small all-reduce before backward; falls back to
+                # the legacy per-rank behavior when the token count is absent.
+                token_count = metrics.pop("__loss_token_count__", None)
+                if (
+                    self.config.global_token_norm
+                    and token_count is not None
+                    and self.is_distributed
+                ):
+                    world_size = dist.get_world_size()
+                    total_count = token_count.detach().float().clone()
+                    dist.all_reduce(total_count, op=dist.ReduceOp.SUM)
+                    if total_count.item() > 0:
+                        loss = loss * (
+                            token_count.float() * world_size / total_count
+                        )
                 scaled_loss = loss / grad_accum
                 scaled_loss.backward()
 
@@ -663,6 +686,9 @@ class Trainer:
                 _draft_tokens, _loss, metrics = self.model(
                     **gpu_batch, **(self.config.val_call_kwargs or {})
                 )
+
+            # Gradient-normalization carrier key is not a metric; drop it.
+            metrics.pop("__loss_token_count__", None)
 
             for k, v in metrics.items():
                 acc = accumulated.get(k)

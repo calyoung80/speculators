@@ -734,6 +734,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
         gradient_checkpointing=args.gradient_checkpointing,
+        global_token_norm=args.global_token_norm,
         max_steps=args.max_steps,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)

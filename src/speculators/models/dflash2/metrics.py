@@ -385,6 +385,10 @@ def compute_metrics(
     metrics["loss_total"] = (
         unary_token_count if unary_token_count is not None else one.clone()
     )
+    if unary_token_count is not None:
+        # Live token count for the trainer's gradient-normalization
+        # all-reduce (popped before metric reduction; see trainer.py).
+        metrics["__loss_token_count__"] = unary_token_count
 
     with torch.no_grad():
         target_ids = targets.argmax(dim=-1)
