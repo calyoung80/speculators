@@ -30,6 +30,7 @@ def compute_metrics(
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = False,
+    loss_chunk_size: int = 0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute loss and accuracy metrics for draft model predictions.
 
@@ -76,6 +77,7 @@ def compute_metrics(
         pos_idx,
         loss_config=loss_config,
         decay_fn=decay_fn,
+        loss_chunk_size=loss_chunk_size,
     )
 
     pred_ids = torch.argmax(logits, dim=-1)
@@ -88,7 +90,14 @@ def compute_metrics(
     ones = torch.tensor(1.0, device=logits.device)
     metrics: dict[str, Any] = {}
     metrics["loss_sum"] = loss.detach().clone()
-    metrics["loss_total"] = ones
+    # True token-weighted denominator (see dspark compute_metrics): makes the
+    # cross-rank reduced loss a global token-weighted mean.
+    token_count = term_losses.pop("__token_count__", None)
+    metrics["loss_total"] = (
+        token_count.to(logits.device).clamp_min(1.0)
+        if token_count is not None
+        else ones
+    )
     for term_name, term_val in term_losses.items():
         metrics[f"{term_name}_sum"] = term_val
         metrics[f"{term_name}_total"] = ones.clone()

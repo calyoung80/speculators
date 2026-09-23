@@ -92,12 +92,20 @@ def js_div_loss(
 def ce_loss(
     logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
     targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+    chunk_size: int = 0,
 ):
     """Compute per-position cross-entropy loss using argmax of target logits as labels.
 
     Args:
         logits: Draft model logits.
         targets: Target model logits (argmax taken to produce hard labels).
+        chunk_size: Optional number of sequence positions per chunk. When > 0,
+            the sequence dimension is processed in slices of ``chunk_size``
+            positions so peak activation memory scales with the chunk instead
+            of the full sequence. Mathematically identical to the unchunked
+            path (cross-entropy is position-wise independent); autograd frees
+            each chunk's intermediates as backward proceeds, so the peak is
+            bound by one chunk.
 
     Returns:
         Per-position cross-entropy loss with shape [1, seq_len].
@@ -105,14 +113,29 @@ def ce_loss(
     batch_size, seq_len, draft_vocab_size = logits.shape
     target_ids = torch.argmax(targets, dim=-1)  # shape: [1, seq_len]
 
-    elementwise_loss = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, draft_vocab_size),
-        target_ids.reshape(-1),
-        reduction="none",
-        ignore_index=-100,
-    ).reshape(batch_size, seq_len)
+    if chunk_size is None or chunk_size <= 0 or chunk_size >= seq_len:
+        elementwise_loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, draft_vocab_size),
+            target_ids.reshape(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).reshape(batch_size, seq_len)
+        return elementwise_loss  # noqa: RET504
 
-    return elementwise_loss  # noqa: RET504
+    chunk_losses = []
+    for start in range(0, seq_len, chunk_size):
+        stop = min(start + chunk_size, seq_len)
+        chunk_logits = logits[:, start:stop]  # [1, chunk, V]
+        chunk_targets = target_ids[:, start:stop]  # [1, chunk]
+        chunk_loss = torch.nn.functional.cross_entropy(
+            chunk_logits.reshape(-1, draft_vocab_size),
+            chunk_targets.reshape(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).reshape(batch_size, stop - start)
+        chunk_losses.append(chunk_loss)
+
+    return torch.cat(chunk_losses, dim=1)  # [1, seq_len]
 
 
 def tv_loss(

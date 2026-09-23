@@ -315,6 +315,14 @@ class LossArgs(_Group):
         'nla, lk_hybrid) or a JSON dict for a weighted combination, e.g. \'{"ce": 0.1, '
         '"tv": 0.9}\'. (default: "ce" for dflash, "kl_div" otherwise).',
     )
+    loss_chunk_size: int = Field(
+        default=0,
+        ge=0,
+        description="Process the sequence dimension of chunkable per-position "
+        "losses (currently CE) in slices of this many positions to bound peak "
+        "activation memory. 0 disables chunking (unchunked legacy behavior). "
+        "Only affects memory, not the loss value.",
+    )
     ttt_steps: int = Field(
         default=3,
         description="Number of test-time-training (TTT) steps the draft is unrolled "

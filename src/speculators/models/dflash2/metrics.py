@@ -338,6 +338,7 @@ def compute_metrics(
     selector_loss_alpha: float = 1.0,
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
+    loss_chunk_size: int = 0,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Combine the unary DFlash objective with a K-way selector objective."""
     chunked_loss_config = _wrap_chunked(loss_config)
@@ -355,6 +356,7 @@ def compute_metrics(
         per_position_loss_weight=per_position_loss_weight,
         dpace_alpha=dpace_alpha,
         sample_from_anchor=sample_from_anchor,
+        loss_chunk_size=loss_chunk_size,
     )
     selector_loss = compute_selector_loss(
         candidate_logits,
@@ -369,12 +371,20 @@ def compute_metrics(
     loss = unary_loss + selector_loss_alpha * selector_loss
 
     one = torch.ones((), device=unary_logits.device)
+    # Token-weighted denominator from the unary objective (see dspark
+    # compute_metrics): makes the cross-rank reduced losses true global
+    # token-weighted means instead of means of per-rank means.
+    unary_token_count = metrics.pop("loss_total", None)
     metrics["unary_loss_sum"] = unary_loss.detach().clone()
-    metrics["unary_loss_total"] = one
+    metrics["unary_loss_total"] = (
+        unary_token_count if unary_token_count is not None else one
+    )
     metrics["selector_loss_sum"] = selector_loss.detach().clone()
     metrics["selector_loss_total"] = one.clone()
     metrics["loss_sum"] = loss.detach().clone()
-    metrics["loss_total"] = one.clone()
+    metrics["loss_total"] = (
+        unary_token_count if unary_token_count is not None else one.clone()
+    )
 
     with torch.no_grad():
         target_ids = targets.argmax(dim=-1)

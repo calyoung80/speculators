@@ -7,6 +7,16 @@ import torch
 
 _EPS = 1e-5
 
+
+def _fn_accepts_chunk_size(loss_fn: Callable) -> bool:
+    """Whether a per-position loss function takes a ``chunk_size`` kwarg."""
+    try:
+        import inspect  # noqa: PLC0415
+
+        return "chunk_size" in inspect.signature(loss_fn).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic callables
+        return False
+
 LossConfig = dict[
     str, tuple[Callable[[torch.Tensor, torch.Tensor], torch.Tensor], float]
 ]
@@ -508,6 +518,7 @@ def compound_loss(
     pos_idx: torch.Tensor,
     loss_config: LossConfig,
     decay_fn: Callable[..., torch.Tensor] | None = None,
+    loss_chunk_size: int = 0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute a weighted sum of loss terms.
 
@@ -517,23 +528,31 @@ def compound_loss(
 
     Returns the total loss and a dict of per-term (unweighted) scalar losses
     keyed as ``"{name}_loss"``.  When the config contains a single term the
-    dict is empty (the overall loss already captures it).
+    dict is empty (the overall loss already captures it). When any term
+    reports a token count, the dict also carries ``__token_count__`` so the
+    caller can report a true token-weighted ``loss_total`` metric.
     """
     total = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
     term_losses: dict[str, torch.Tensor] = {}
+    token_counts: list[torch.Tensor] = []
     multi = len(loss_config) > 1
     for name, (fn, weight) in loss_config.items():
-        term = loss_function(
+        term, token_count = loss_function(
             logits,
             targets,
             loss_mask,
             pos_idx,
             loss_fn=fn,
             decay_fn=decay_fn,
+            loss_chunk_size=loss_chunk_size,
+            return_token_count=True,
         )
+        token_counts.append(token_count)
         if multi:
             term_losses[f"{name}_loss"] = term.detach()
         total = total + weight * term
+    if token_counts:
+        term_losses["__token_count__"] = torch.stack(token_counts).sum(dim=0)
     return total, term_losses
 
 
@@ -544,6 +563,8 @@ def loss_function(
     pos_idx: torch.Tensor,  # shape: [1, seq_len]
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = kl_div_loss,
     decay_fn: Callable[..., torch.Tensor] | None = None,
+    loss_chunk_size: int = 0,
+    return_token_count: bool = False,
 ):
     """Compute masked, optionally position-decayed training loss.
 
@@ -554,11 +575,20 @@ def loss_function(
         pos_idx: Position indices within each speculative block.
         loss_fn: Per-position loss function (default: kl_div_loss).
         decay_fn: Optional position-dependent decay weighting function.
+        loss_chunk_size: When > 0 and the loss function supports it, process
+            the sequence dimension in chunks of this many positions to bound
+            peak activation memory (only affects memory, not the result).
+        return_token_count: When True, also return the effective (decayed)
+            token count used as the denominator, as a tensor.
 
     Returns:
-        Scalar mean loss across the batch.
+        Scalar mean loss across the batch, plus the token count tensor when
+        ``return_token_count`` is True.
     """
-    elementwise_loss = loss_fn(logits, targets)  # shape: [1, seq_len]
+    if loss_chunk_size > 0 and _fn_accepts_chunk_size(loss_fn):
+        elementwise_loss = loss_fn(logits, targets, chunk_size=loss_chunk_size)
+    else:
+        elementwise_loss = loss_fn(logits, targets)  # shape: [1, seq_len]
 
     loss_mask = loss_mask.to(elementwise_loss.dtype)
     elementwise_loss = elementwise_loss * loss_mask
@@ -573,4 +603,8 @@ def loss_function(
         denominator = loss_mask.sum(dim=1) + _EPS
 
     batch_loss = torch.sum(elementwise_loss, dim=1) / denominator  # shape: [1]
-    return batch_loss.mean()  # shape: []
+    loss = batch_loss.mean()  # shape: []
+    if return_token_count:
+        token_count = denominator.sum().detach()
+        return loss, token_count
+    return loss

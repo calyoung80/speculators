@@ -68,12 +68,16 @@ def _setup_dataloader(
         max_batches=max_batches,
     )
     use_workers = num_workers > 0
+    # Pinned host memory interacts badly with some accelerator runtimes
+    # (observed shm/pin deadlocks with Mooncake TE on Ascend NPU), so the
+    # default is False but can be re-enabled per deployment via env.
+    pin_memory = os.environ.get("DATALOADER_PIN_MEMORY", "0") == "1"
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if use_workers else None,
-        pin_memory=False,
+        pin_memory=pin_memory,
         collate_fn=CollateFn(
             total_seq_len,
             hidden_size,

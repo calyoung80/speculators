@@ -75,8 +75,17 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     ) -> None:
         # Forcibly override config settings
         if config.transformer_layer_config._attn_implementation is None:  # noqa: SLF001
+            # flex_attention's torch.compile path has no Triton backend on
+            # Ascend NPU (fails with runtime error 207001). Fall back to the
+            # eager additive float-mask path there; keep flex elsewhere.
+            npu_available = False
+            if hasattr(torch, "npu"):
+                try:
+                    npu_available = torch.npu.is_available()
+                except Exception:  # noqa: BLE001 - driver-less hosts
+                    npu_available = False
             config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
-                "simple_flex_attention"
+                "eager" if npu_available else "simple_flex_attention"
             )
         self._attn_impl = config.transformer_layer_config._attn_implementation  # noqa: SLF001
         self._create_mask_fn = (
@@ -303,6 +312,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "max_anchors": max_anchors,
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
+            "loss_chunk_size": kwargs.get("loss_chunk_size", 0),
         }
         return dict(shared), dict(shared)
 
@@ -499,6 +509,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         max_anchors: int = 512,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
+        loss_chunk_size: int = 0,
         **kwargs,
     ):
         _, logits, targets, aligned_loss_mask, _ = self._backbone_forward(
@@ -521,5 +532,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
+            loss_chunk_size=loss_chunk_size,
         )
         return None, loss, metrics

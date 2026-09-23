@@ -68,6 +68,7 @@ def compute_metrics(
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = True,
+    loss_chunk_size: int = 0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -88,7 +89,13 @@ def compute_metrics(
         )
 
     loss, term_losses = compound_loss(
-        logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn
+        logits,
+        targets,
+        loss_mask,
+        pos_idx,
+        loss_config=loss_config,
+        decay_fn=decay_fn,
+        loss_chunk_size=loss_chunk_size,
     )
 
     # Analytical per-position acceptance rate = distributional overlap
@@ -138,7 +145,15 @@ def compute_metrics(
 
     ones = torch.ones((), device=device)
     metrics["loss_sum"] = loss.detach().clone()
-    metrics["loss_total"] = ones
+    # True token-weighted denominator so that, after the trainer's cross-rank
+    # sum-reduction, the logged loss is the global token-weighted mean rather
+    # than a mean of per-rank means (which over-weights token-poor ranks).
+    token_count = term_losses.pop("__token_count__", None)
+    metrics["loss_total"] = (
+        token_count.to(device).clamp_min(1.0)
+        if token_count is not None
+        else ones
+    )
     for term_name, term_val in term_losses.items():
         metrics[f"{term_name}_sum"] = term_val
         metrics[f"{term_name}_total"] = ones.clone()

@@ -112,6 +112,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             ),
             "dpace_alpha": kwargs.get("dpace_alpha", 0.5),
             "selector_loss_alpha": kwargs.get("selector_loss_alpha", 1.0),
+            "loss_chunk_size": kwargs.get("loss_chunk_size", 0),
         }
         return dict(shared), dict(shared)
 
@@ -144,6 +145,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         selector_loss_alpha: float = 1.0,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
+        loss_chunk_size: int = 0,
         **kwargs,
     ) -> tuple[None, torch.Tensor, dict[str, Any]]:
         hidden, unary_logits, targets, aligned_loss_mask, block_indices = (
@@ -191,5 +193,6 @@ class DFlash2DraftModel(DFlashDraftModel):
             selector_loss_alpha=selector_loss_alpha,
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
+            loss_chunk_size=loss_chunk_size,
         )
         return None, loss, metrics
