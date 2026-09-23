@@ -35,6 +35,7 @@ from speculators.train.distributed import (
 )
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
+from speculators.train.recovery import BatchRecoveryCoordinator
 from speculators.train.utils import normalize_counted_metrics
 
 root_logger = logging.getLogger("speculators")
@@ -94,9 +95,24 @@ class _StepTimer:
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 MIN_STEP_PCT = 0.25
 
-# Re-synchronise ranks every N validation batches to bound cross-rank skew, which would
-# otherwise blow the NCCL watchdog at the end-of-epoch metrics all-reduce. 0 disables.
+# Bound circuit-breaker detection latency without synchronizing every batch.
+_RECOVERY_SYNC_INTERVAL = 50
+
+# Bound rank skew before the validation metrics reduction.
 _VAL_SYNC_INTERVAL = 50
+
+
+def _should_sync_recovery(
+    step: int,
+    total_steps: int,
+    *,
+    will_stop: bool = False,
+) -> bool:
+    return (
+        will_stop
+        or step == total_steps
+        or (_RECOVERY_SYNC_INTERVAL > 0 and step % _RECOVERY_SYNC_INTERVAL == 0)
+    )
 
 
 class TrainerConfig(NamedTuple):
@@ -446,12 +462,26 @@ class Trainer:
             step_interval = max(1, round(num_steps * self.config.checkpoint_freq))
         t_before_fetch = time.perf_counter()
         timer = _StepTimer()
+        recovery = BatchRecoveryCoordinator("training")
+        remaining_steps = len(self.train_loader)
         for local_step_rel, batch in enumerate(train_loader, 1):
             # local_step is 1-based index into the *full* epoch (not the slice).
             local_step = local_step_rel + skip_steps
             timer.reset(self.global_step % self.config.log_freq == 0)
 
             timer.mark_value("start", t_before_fetch)
+            will_stop = (
+                self.config.max_steps is not None
+                and self.global_step + 1 >= self.config.max_steps
+            )
+            recovery.consume(
+                batch,
+                synchronize=_should_sync_recovery(
+                    local_step_rel,
+                    remaining_steps,
+                    will_stop=will_stop,
+                ),
+            )
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)
@@ -482,6 +512,13 @@ class Trainer:
                 continue
 
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+            metrics["error_records_sum"] = torch.tensor(
+                batch["error_records"], dtype=torch.int32, device=loss.device
+            )
+            metrics["error_records_total"] = torch.tensor(
+                1.0 if self.rank == 0 else 0, device=loss.device
+            )
 
             timer.mark("bwd")
             self._optimizers_step()
@@ -556,8 +593,13 @@ class Trainer:
 
         accumulated: dict[str, torch.Tensor] = {}
         num_batches = len(val_loader)
+        recovery = BatchRecoveryCoordinator("validation")
         for i, batch in enumerate(val_loader):
             self._maybe_val_sync(i)
+            recovery.consume(
+                batch,
+                synchronize=_should_sync_recovery(i, num_batches - 1),
+            )
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)

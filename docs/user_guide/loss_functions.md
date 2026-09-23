@@ -1,9 +1,11 @@
 # Loss Functions
 
-The training loss controls what the draft model is optimized for. Select it with `--loss-fn` in [`train.py`](../cli/train.md), which accepts either a single loss name or a JSON dict for a weighted combination. It applies to Eagle-3, P-EAGLE, DFlash, and DSpark. MTP uses its own multi-step cross-entropy loss and ignores this flag.
+The training loss controls what the draft model is optimized for. Select it with `--loss-fn` in [`speculators train`](../cli/train.md), which accepts either a single loss name or a JSON dict for a weighted combination. It applies to Eagle-3, P-EAGLE, DFlash, and DSpark. MTP uses its own multi-step cross-entropy loss and ignores this flag.
+
+The fused Triton implementation is the default. Use `--loss-implementation eager` for compatibility or numerical validation; eager losses may OOM with DFlash or DSpark.
 
 ```bash
-python scripts/train.py ... --loss-fn kl_div
+speculators train ... --loss-fn kl_div
 ```
 
 ## Available Losses
@@ -20,7 +22,7 @@ python scripts/train.py ... --loss-fn kl_div
 | `nla`       | Negative log-acceptance, `-log(alpha)` | TV's target with a `1 / alpha` gradient boost, so it trains from a cold start. |
 | `lk_hybrid` | Adaptive KL/TV blend                   | `lambda * KL + (1 - lambda) * TV` with `lambda = exp(-3 * alpha)`, detached.   |
 
-`tv` and `nla` use a fused Triton kernel on CUDA devices when it is available, and fall back to eager PyTorch otherwise.
+All losses use the selected implementation; there is no automatic fallback.
 
 ## Choosing a Loss
 
@@ -33,7 +35,7 @@ python scripts/train.py ... --loss-fn kl_div
 Pass a JSON dict to train on a weighted sum of several losses. Weights are used as provided and are not normalized. Each term is also logged separately as `{name}_loss`, before its weight is applied.
 
 ```bash
-python scripts/train.py ... --loss-fn '{"ce": 0.1, "tv": 0.9}'
+speculators train ... --loss-fn '{"ce": 0.1, "tv": 0.9}'
 ```
 
 ## References

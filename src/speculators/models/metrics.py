@@ -12,6 +12,33 @@ LossConfig = dict[
 ]
 
 
+@torch.no_grad()
+def compute_accepted_length_counts(
+    correct: torch.Tensor,  # shape: [num_blocks, num_draft_slots]
+    valid: torch.Tensor,  # shape: [num_blocks, num_draft_slots]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Count accepted length per speculative block as raw sum/total counts.
+
+    A block is accepted up to its first wrong draft slot, so its length is the
+    leading run of correct slots plus the verifier's always-emitted bonus token
+    (vLLM's convention). Forming the run inside the block preserves the
+    correlation between slots; a product of per-slot marginals discards it and
+    understates the result.
+
+    Args:
+        correct: Whether each draft slot matched the target.
+        valid: Whether each draft slot is trained on (block-shaped loss mask).
+
+    Returns:
+        Tuple of (accepted_length_sum, valid_block_total) as raw counts suitable
+        for distributed reduction before computing the ratio.
+    """
+    accepted = torch.logical_and(correct, valid).to(torch.float32)
+    per_block_len = accepted.cumprod(dim=-1).sum(dim=-1) + 1.0
+    block_valid = valid.any(dim=-1).to(torch.float32)
+    return (per_block_len * block_valid).sum(), block_valid.sum()
+
+
 def compute_accuracy_single_step(
     pred_ids: torch.Tensor,  # shape: [1, seq_len]
     target_ids: torch.Tensor,  # shape: [1, seq_len]
@@ -37,9 +64,9 @@ def compute_accuracy_single_step(
         cond_total = prev_correct.sum().float()
         correct = torch.logical_and(prev_correct, correct, out=prev_correct)
     if loss_mask is not None:
-        correct = torch.masked_select(
-            correct.cpu(), loss_mask.to(torch.bool).cpu()
-        ).to(correct.device)
+        correct = torch.masked_select(correct.cpu(), loss_mask.to(torch.bool).cpu()).to(
+            correct.device
+        )
 
     correct_sum = correct.float().sum()
     full_total = torch.tensor(correct.numel(), dtype=torch.float, device=correct.device)
@@ -69,12 +96,12 @@ def compute_accuracy_multi_step(
         Overall counts can be derived by summing these.
     """
     correct = pred_ids == target_ids
-    correct = torch.masked_select(
-        correct.cpu(), loss_mask.to(torch.bool).cpu()
-    ).to(correct.device)
-    pos_idx = torch.masked_select(
-        pos_idx.cpu(), loss_mask.to(torch.bool).cpu()
-    ).to(pos_idx.device)
+    correct = torch.masked_select(correct.cpu(), loss_mask.to(torch.bool).cpu()).to(
+        correct.device
+    )
+    pos_idx = torch.masked_select(pos_idx.cpu(), loss_mask.to(torch.bool).cpu()).to(
+        pos_idx.device
+    )
 
     correct_per_pos = torch.zeros(num_pos, dtype=torch.float, device=correct.device)
     total_per_pos = torch.zeros(num_pos, dtype=torch.float, device=correct.device)
