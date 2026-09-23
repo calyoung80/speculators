@@ -104,13 +104,15 @@ torchrun --standalone --nproc_per_node=4 -m speculators.train \
 
 - **`--fsdp-shard`** (flag) Shard model parameters across GPUs with FSDP. By default, parameters are fully replicated (DDP-like). Enable this when the model does not fit in a single GPU's memory.
 
+- **`--gradient-checkpointing`** (flag) Enable gradient checkpointing on decoder layers to save activation memory at the cost of ~30-50% slower backward. Each decoder layer's forward is checkpointed: only the layer input is saved for backward; intermediate activations (MLP, attention) are recomputed. Saves ~10 GB for a 5-layer DSpark model with 32K sequence length. Recommended for 32K+ sequence lengths or large `--max-anchors`.
+
 ### Training Arguments
 
 - **`--save-path`** (str, default: `"./checkpoints"`) Directory to save model checkpoints.
 
 - **`--epochs`** (int, default: `20`) Number of training epochs.
 
-- **`--lr`** (float, default: `1e-4`) Learning rate.
+- **`--lr`** (float, default: `1e-3`) Learning rate.
 
 - **`--train-data-ratio`** (float, default: `0.9`) Ratio of data to use for training, the rest of the provided data will be used for validation.
 
@@ -136,7 +138,7 @@ torchrun --standalone --nproc_per_node=4 -m speculators.train \
 
 - **`--weight-decay`** (float, default: `0.01`) Weight decay for the AdamW optimizer (and the AdamW group in muon mode).
 
-- **`--muon-lr`** (float, default: `10*lr`) Learning rate for the Muon (2D weights) group. Only used with `--optimizer muon`. Defaults to 10× the `--lr` value.
+- **`--muon-lr`** (float, default: `lr`) Learning rate for the Muon (2D weights) group. Only used with `--optimizer muon`. Defaults to the `--lr` value.
 
 - **`--muon-momentum`** (float, default: `0.95`) Momentum for the Muon optimizer. Only used with `--optimizer muon`.
 

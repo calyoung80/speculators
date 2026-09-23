@@ -42,6 +42,24 @@ root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
 
 
+def _all_reduce_metrics(metrics: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Sum *metrics* across ranks with a single collective.
+
+    Used by both the training and validation metric reductions. Values are
+    returned as float tensors in the same key order.
+
+    Keys are sorted before stacking: dynamic metric construction can otherwise
+    make ranks enter the HCCL collectives with different key orders and
+    deadlock at epoch end (observed on Ascend NPU).
+    """
+    if not metrics:
+        return {}
+    keys = sorted(metrics)
+    stacked = torch.stack([metrics[k].float().reshape(()) for k in keys])
+    dist.all_reduce(stacked, op=dist.ReduceOp.SUM)
+    return dict(zip(keys, stacked, strict=True))
+
+
 class _StepTimer:
     # Each mark()/now() forces an accelerator.synchronize to capture true GPU time.
     # This serialises the CUDA pipeline, so profiled steps are slower; keep
@@ -140,6 +158,7 @@ class TrainerConfig(NamedTuple):
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
     fsdp_shard: bool = False
+    gradient_checkpointing: bool = False
     max_steps: int | None = None
     gradient_accumulation_steps: int = 1
 
@@ -153,11 +172,17 @@ def _resolve_scheduler_steps(
     Explicit ``scheduler_warmup_steps`` wins; otherwise ``scheduler_warmup_ratio``
     (a fraction of total steps, validated to ``[0, 1]``) is used; otherwise the
     default of 1% of the resolved total steps. ``scheduler_total_steps`` defaults
-    to ``num_epochs * train_loader_len``.
+    to ``max_steps`` when set, else ``num_epochs * train_loader_len``.
     """
+    # Keep both fixes: divide by gradient-accumulation steps (local fix) and
+    # let max_steps bound the LR schedule horizon (upstream #1104).
     default_total_steps = (config.num_epochs * train_loader_len) // max(
         config.gradient_accumulation_steps, 1
     )
+    # max_steps bounds the training loop, so the LR schedule must decay over the
+    # same horizon; otherwise the LR endpoint is never reached.
+    if config.max_steps is not None:
+        default_total_steps = config.max_steps
     scheduler_total_steps = (
         config.scheduler_total_steps
         if config.scheduler_total_steps is not None
@@ -301,6 +326,26 @@ class Trainer:
     def setup_model(self):
         # Verify model is compatible with training infrastructure
         SpeculatorModel.verify_training_compatible(self.model)
+
+        # Enable gradient checkpointing BEFORE FSDP/DDP wrapping to save
+        # activation memory at the cost of recomputation during backward.
+        # Each decoder layer's forward is checkpointed: only the layer input
+        # is saved for backward; intermediate activations (MLP, attention)
+        # are recomputed. Saves ~10 GB for 5-layer DSpark with 32K seq.
+        if self.config.gradient_checkpointing:
+            if not self.model.supports_gradient_checkpointing:
+                raise ValueError(
+                    f"{type(self.model).__name__} does not support "
+                    "gradient checkpointing"
+                )
+            # use_reentrant=False is mandatory: the DFlash decoder layers have
+            # kwargs-only forward signatures and the reentrant variant silently
+            # fails to checkpoint them. Also enabled before FSDP/DDP wrapping
+            # so the layer hooks register on the real modules.
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            root_logger.info("Gradient checkpointing enabled (use_reentrant=False)")
 
         load_checkpoint = (
             self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1
@@ -518,10 +563,12 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
             metrics["error_records_sum"] = torch.tensor(
-                batch["error_records"], dtype=torch.int32, device=loss.device
+                batch["error_records"], dtype=torch.float32, device=loss.device
             )
             metrics["error_records_total"] = torch.tensor(
-                1.0 if self.rank == 0 else 0, device=loss.device
+                1.0 if self.rank == 0 else 0,
+                dtype=torch.float32,
+                device=loss.device,
             )
 
             timer.mark("bwd")
@@ -539,17 +586,8 @@ class Trainer:
             if timer.enabled:
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
                 profile = timer.profile(num_tokens)
-                if self.is_distributed and metrics:
-                    # Reduce one stable FP32 vector rather than issuing one
-                    # collective per dict entry. Dynamic metric construction
-                    # can otherwise make ranks enter the HCCL collectives in
-                    # different orders and deadlock at epoch end.
-                    metric_names = sorted(metrics)
-                    reduced_metrics = torch.stack(
-                        [metrics[name].detach().float() for name in metric_names]
-                    )
-                    dist.reduce(reduced_metrics, dst=0, op=dist.ReduceOp.SUM)
-                    metrics = dict(zip(metric_names, reduced_metrics, strict=True))
+                if self.is_distributed:
+                    metrics = _all_reduce_metrics(metrics)
 
                 metrics = {k: v.item() for k, v in metrics.items()}
                 world_size = dist.get_world_size() if self.is_distributed else 1
@@ -632,10 +670,9 @@ class Trainer:
 
         val_metrics: dict[str, float] = {}
         if accumulated:
-            stacked = torch.stack(list(accumulated.values()))
             if self.is_distributed:
-                dist.all_reduce(stacked, op=dist.ReduceOp.SUM)
-            val_metrics = dict(zip(accumulated, stacked.tolist(), strict=True))
+                accumulated = _all_reduce_metrics(accumulated)
+            val_metrics = {k: v.item() for k, v in accumulated.items()}
 
         world_size = dist.get_world_size() if self.is_distributed else 1
         val_metrics = {k: v / num_batches for k, v in val_metrics.items()}

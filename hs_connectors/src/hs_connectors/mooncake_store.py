@@ -17,6 +17,8 @@ from typing import Any
 
 import torch
 
+from hs_connectors.device import ensure_accelerator_context
+
 logger = logging.getLogger(__name__)
 
 _MANIFEST_VERSION = 1
@@ -143,6 +145,7 @@ class MooncakeHiddenStatesStore:
             pass
 
         store = MooncakeDistributedStore()
+        ensure_accelerator_context()
         result = store.setup(
             self.config.local_hostname,
             self.config.metadata_server,
