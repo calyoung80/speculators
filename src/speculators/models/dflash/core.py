@@ -35,7 +35,10 @@ logger = logging.getLogger(__name__)
 
 # Compile so the mask builds block-sparse instead of materializing DFlash's huge
 # dense [Q, KV] grid every step. (No benefit for EAGLE3's small autoregressive mask.)
-_compiled_create_block_mask = torch.compile(create_block_mask)
+# conditional_torch_compile (not bare torch.compile): on Ascend NPU the compile
+# path hits a BiSheng IR error; the wrapper keeps the eager function there and
+# compiles only on CUDA. Aligns with upstream PR #918.
+_compiled_create_block_mask = conditional_torch_compile(create_block_mask)
 
 
 @SpeculatorModel.register("dflash")
