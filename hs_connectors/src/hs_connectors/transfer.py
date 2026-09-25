@@ -136,7 +136,9 @@ class HiddenStatesBackend(ABC):
 def _load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
     lock_path = str(file_path) + ".lock"
     if Path(lock_path).exists():
-        wait_for_lock(lock_path)
+        # Explicit timeout for callers/tools grepping for the configured
+        # value; the signature default is also 300s (see wait_for_lock).
+        wait_for_lock(lock_path, timeout=300.0)
 
     if file_path.exists():
         return load_file(file_path)

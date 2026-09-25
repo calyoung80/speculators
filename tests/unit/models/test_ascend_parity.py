@@ -10,6 +10,7 @@ Covers the four parity items from the 2026-09-23 audit
 """
 
 import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -337,6 +338,29 @@ class TestOnlineGenerationConcurrency:
         from hs_connectors.transfer import wait_for_lock
 
         assert inspect.signature(wait_for_lock).parameters["timeout"].default == 300.0
+
+    def test_m40_lock_env_forces_upstream_lock(self, monkeypatch):
+        # Compatibility with the original m40 patch: LOCK=1 is the revert
+        # switch and wins even when a concurrency value is set.
+        monkeypatch.setenv("SPECULATORS_ONLINE_GENERATION_CONCURRENCY", "8")
+        monkeypatch.setenv("SPECULATORS_ONLINE_GENERATION_LOCK", "1")
+        import importlib
+
+        import speculators.train.data as data_mod
+
+        importlib.reload(data_mod)
+        assert data_mod._generation_semaphore is None
+
+    def test_check_grep_compat(self):
+        # The m40 s3 check script greps these two literals; both must match.
+        data_src = Path(
+            __import__("speculators.train.data", fromlist=["x"]).__file__
+        ).read_text()
+        assert "_ONLINE_GENERATION_CONCURRENCY" in data_src
+        import hs_connectors.transfer as tr
+
+        tr_src = Path(tr.__file__).read_text()
+        assert "timeout=300.0" in tr_src
     """E3 parity #4b: gradients (not just metrics) are token-normalized.
 
     With DDP averaging, backwarding L_r = S_r/N_r lets token-poor ranks

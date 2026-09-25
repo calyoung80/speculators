@@ -40,15 +40,22 @@ _ONLINE_GENERATION_LOCK = Path("/tmp/speculators-online-hidden-state-generation.
 # flying at any time). On single-producer pipelines that already queue
 # server-side this wastes the whole fetch window - measured ~26s of a 27.4s
 # step. Setting SPECULATORS_ONLINE_GENERATION_CONCURRENCY>0 replaces the
-# exclusive lock with a bounded semaphore (default 8 concurrent requests;
+# exclusive lock with a bounded semaphore (8 concurrent requests;
 # load-tested stable at 8). Default is 0 = upstream lock behavior, so shared
 # code trees stay conservative unless a launch script opts in explicitly.
+#
+# SPECULATORS_ONLINE_GENERATION_LOCK=1 is a hard override that forces the
+# upstream lock even when a concurrency value is set (compatibility with the
+# original m40 patch, where this env was the revert switch).
 _ONLINE_GENERATION_CONCURRENCY = int(
     os.environ.get("SPECULATORS_ONLINE_GENERATION_CONCURRENCY", "0")
 )
+_ONLINE_GENERATION_LOCK_FORCED = (
+    os.environ.get("SPECULATORS_ONLINE_GENERATION_LOCK", "0") == "1"
+)
 _generation_semaphore = (
     threading.Semaphore(_ONLINE_GENERATION_CONCURRENCY)
-    if _ONLINE_GENERATION_CONCURRENCY > 0
+    if _ONLINE_GENERATION_CONCURRENCY > 0 and not _ONLINE_GENERATION_LOCK_FORCED
     else None
 )
 
