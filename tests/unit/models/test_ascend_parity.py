@@ -271,15 +271,81 @@ class TestAnchorBlockFloatMask:
             torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
-class TestGlobalGradientTokenNorm:
+class TestOnlineGenerationConcurrency:
+    """Fetch-pipeline acceleration: replace the global generation lock with a
+    bounded semaphore when SPECULATORS_ONLINE_GENERATION_CONCURRENCY>0.
+
+    Default (0/unset) keeps the upstream fcntl lock so shared code trees are
+    unaffected; launch scripts opt in explicitly. Companion change:
+    hs_connectors wait_for_lock timeout 10s -> 300s (concurrent writers queue
+    large safetensors writes; a short timeout caused TimeoutError retry loops
+    that stalled training).
+    """
+
+    def test_default_is_upstream_lock(self, monkeypatch):
+        monkeypatch.delenv("SPECULATORS_ONLINE_GENERATION_CONCURRENCY", raising=False)
+        import importlib
+
+        import speculators.train.data as data_mod
+
+        importlib.reload(data_mod)
+        assert data_mod._generation_semaphore is None
+
+    def test_env_enables_semaphore(self, monkeypatch):
+        monkeypatch.setenv("SPECULATORS_ONLINE_GENERATION_CONCURRENCY", "8")
+        import importlib
+
+        import speculators.train.data as data_mod
+
+        importlib.reload(data_mod)
+        assert data_mod._generation_semaphore is not None
+
+    def test_semaphore_bounds_concurrency(self, monkeypatch):
+        monkeypatch.setenv("SPECULATORS_ONLINE_GENERATION_CONCURRENCY", "2")
+        import importlib
+        import threading
+
+        import speculators.train.data as data_mod
+
+        importlib.reload(data_mod)
+        inside = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def worker():
+            nonlocal inside, peak
+            with data_mod._online_generation_lock():
+                with lock:
+                    inside += 1
+                    peak = max(peak, inside)
+                import time
+
+                time.sleep(0.1)
+                with lock:
+                    inside -= 1
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert peak == 2
+
+    def test_wait_for_lock_default_timeout_300(self):
+        import inspect
+
+        from hs_connectors.transfer import wait_for_lock
+
+        assert inspect.signature(wait_for_lock).parameters["timeout"].default == 300.0
     """E3 parity #4b: gradients (not just metrics) are token-normalized.
 
     With DDP averaging, backwarding L_r = S_r/N_r lets token-poor ranks
     dominate (observed 12x p50 imbalance). The trainer rescale factor
     N_r * R / N_total makes the DDP-averaged gradient equal the gradient
-    of the global token-weighted loss sum(S)/sum(N).
+        of the global token-weighted loss sum(S)/sum(N).
     """
 
+class TestGlobalGradientTokenNorm:
     def test_rescale_math(self):
         world = 2
         n_r = [100.0, 8.0]  # 12.5x imbalance

@@ -24,7 +24,16 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-def wait_for_lock(lock_path: str, timeout: float = 10.0, poll_interval: float = 0.1):
+def wait_for_lock(lock_path: str, timeout: float = 300.0, poll_interval: float = 0.1):
+    """Wait for the writer's advisory lock on a hidden-states file.
+
+    The default timeout is 300s: with concurrent online generation (see
+    SPECULATORS_ONLINE_GENERATION_CONCURRENCY in speculators.train.data) the
+    vLLM side may queue several large safetensors writes before releasing
+    this lock; a short timeout (the historical 10s) made the reader raise
+    TimeoutError, retry, and re-generate - a failure loop that stalled
+    training (48 consecutive failures observed before this was raised).
+    """
     fd = os.open(lock_path, os.O_RDWR)
     try:
         deadline = time.monotonic() + timeout

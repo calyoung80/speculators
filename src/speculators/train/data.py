@@ -1,5 +1,7 @@
 import fcntl
 import logging
+import os
+import threading
 import time
 import warnings
 from collections.abc import Callable, Sequence
@@ -31,11 +33,35 @@ from speculators.train.recovery import (
 
 BatchType = dict[str, Any]
 logger = logging.getLogger("speculators")
-
 _ONLINE_GENERATION_LOCK = Path("/tmp/speculators-online-hidden-state-generation.lock")
+
+# The upstream fcntl lock serializes ALL in-flight online hidden-state
+# generation requests across ranks and dataloader workers (only one request
+# flying at any time). On single-producer pipelines that already queue
+# server-side this wastes the whole fetch window - measured ~26s of a 27.4s
+# step. Setting SPECULATORS_ONLINE_GENERATION_CONCURRENCY>0 replaces the
+# exclusive lock with a bounded semaphore (default 8 concurrent requests;
+# load-tested stable at 8). Default is 0 = upstream lock behavior, so shared
+# code trees stay conservative unless a launch script opts in explicitly.
+_ONLINE_GENERATION_CONCURRENCY = int(
+    os.environ.get("SPECULATORS_ONLINE_GENERATION_CONCURRENCY", "0")
+)
+_generation_semaphore = (
+    threading.Semaphore(_ONLINE_GENERATION_CONCURRENCY)
+    if _ONLINE_GENERATION_CONCURRENCY > 0
+    else None
+)
+
 
 @contextmanager
 def _online_generation_lock():
+    if _generation_semaphore is not None:
+        _generation_semaphore.acquire()
+        try:
+            yield
+        finally:
+            _generation_semaphore.release()
+        return
     with _ONLINE_GENERATION_LOCK.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
