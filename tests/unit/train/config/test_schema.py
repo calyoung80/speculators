@@ -11,6 +11,7 @@ import pytest
 from speculators.train.config import TrainConfig
 from speculators.train.config.schema import (
     CONFIG_DESTS,
+    DataArgs,
     DFlash2Args,
     DFlashArgs,
     DraftArgs,
@@ -29,6 +30,16 @@ def test_flatten_covers_exactly_the_schema_fields():
     # dict by name (**kwargs / args.<field>), so the key set is the contract.
     flat = TrainConfig().flatten()
     assert set(flat) == CONFIG_DESTS
+
+
+def test_dflash2_objective_chunk_blocks_round_trip():
+    cfg = TrainConfig(
+        speculator_type="dflash2",
+        data=DataArgs(objective_chunk_blocks=7),
+    )
+    flat = cfg.flatten()
+    assert flat["objective_chunk_blocks"] == 7
+    assert TrainConfig.from_flat(flat) == cfg
     # Order is deterministic (declaration order) so the run.yaml dump stays stable.
     assert list(flat) == list(TrainConfig(speculator_type="dflash").flatten())
 

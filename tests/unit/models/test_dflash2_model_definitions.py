@@ -520,10 +520,61 @@ def test_trainer_kwargs_include_selector_loss_alpha():
         loss_fn="ce",
         loss_implementation="eager",
         selector_loss_alpha=0.25,
+        objective_chunk_blocks=2,
     )
 
     assert train_kwargs["selector_loss_alpha"] == pytest.approx(0.25)
     assert val_kwargs["selector_loss_alpha"] == pytest.approx(0.25)
+    assert train_kwargs["objective_chunk_blocks"] == 2
+    assert val_kwargs["objective_chunk_blocks"] == 2
+
+
+def test_objective_chunking_matches_full_forward():
+    """Chunked objective projection preserves the legacy loss and metrics."""
+    torch.manual_seed(11)
+    model = DFlash2DraftModel(_tiny_config()).float().eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.isnan().any():
+                torch.nn.init.normal_(parameter, std=0.02)
+    seq_len = 16
+    hidden_size = model.config.transformer_layer_config.hidden_size
+    inputs = {
+        "hidden_states": torch.randn(1, seq_len, 2 * hidden_size),
+        "input_ids": torch.randint(0, model.verifier_vocab_size, (1, seq_len)),
+        "loss_mask": torch.ones(1, seq_len),
+        "verifier_last_hidden_states": torch.randn(1, seq_len, hidden_size),
+        "document_ids": torch.zeros(1, seq_len, dtype=torch.long),
+    }
+    loss_config = resolve_loss_config("ce", "eager")
+    tv_loss_fn = resolve_loss_config("tv", "eager")["tv"][0]
+
+    with torch.no_grad():
+        torch.manual_seed(23)
+        _, full_loss, full_metrics = model(
+            **inputs,
+            max_anchors=2,
+            objective_chunk_blocks=0,
+            loss_config=loss_config,
+            tv_loss_fn=tv_loss_fn,
+        )
+        torch.manual_seed(23)
+        _, chunked_loss, chunked_metrics = model(
+            **inputs,
+            max_anchors=2,
+            objective_chunk_blocks=1,
+            loss_config=loss_config,
+            tv_loss_fn=tv_loss_fn,
+        )
+
+    torch.testing.assert_close(chunked_loss, full_loss, atol=1e-5, rtol=1e-5)
+    for name in ("loss", "unary_loss", "selector_loss"):
+        torch.testing.assert_close(
+            chunked_metrics[f"{name}_sum"] / chunked_metrics[f"{name}_total"],
+            full_metrics[f"{name}_sum"] / full_metrics[f"{name}_total"],
+            atol=1e-5,
+            rtol=1e-5,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

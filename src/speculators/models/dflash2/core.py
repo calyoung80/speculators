@@ -2,6 +2,7 @@ from collections.abc import Callable
 from typing import Any, ClassVar
 
 import torch
+from torch.utils.checkpoint import checkpoint
 from transformers import PretrainedConfig
 
 from speculators.losses import LossConfig, kl_div_loss, resolve_loss_config, tv_loss
@@ -107,6 +108,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             "tv_loss_fn": tv_loss_fn,
             "gamma": kwargs.get("dflash_decay_gamma", 4.0),
             "max_anchors": kwargs.get("max_anchors", 512),
+            "objective_chunk_blocks": kwargs.get("objective_chunk_blocks", 0),
             "per_position_loss_weight": kwargs.get(
                 "per_position_loss_weight", "fixed-exp-decay"
             ),
@@ -128,53 +130,34 @@ class DFlash2DraftModel(DFlashDraftModel):
         # For token sequence 0 1 2 3 return previous token ids 0 0 1 2
         return torch.cat([block_tokens[:, :1], block_tokens[:, :-1]], dim=1)
 
-    @conditional_torch_compile
-    def forward(
+    def _compute_objective(
         self,
-        hidden_states: torch.Tensor,  # shape: [1, total_seq_len,num_hidden*hidden_size]
-        input_ids: torch.Tensor,  # shape: [1, total_seq_len]
-        loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
-        verifier_last_hidden_states: torch.Tensor,  # shape: [1, total_seq_len, hidden_size] # noqa: E501
-        document_ids: torch.Tensor,  # shape: [1, total_seq_len]
-        position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
-        loss_config: LossConfig | None = None,
-        tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = tv_loss,
-        gamma: float = 4.0,
-        max_anchors: int = 512,
-        selector_loss_alpha: float = 1.0,
-        per_position_loss_weight: str = "fixed-exp-decay",
-        dpace_alpha: float = 0.5,
-        **kwargs,
-    ) -> tuple[None, torch.Tensor, dict[str, Any]]:
-        hidden, unary_logits, targets, aligned_loss_mask, block_indices = (
-            self._backbone_forward(
-                hidden_states,
-                input_ids,
-                loss_mask,
-                verifier_last_hidden_states,
-                document_ids,
-                position_ids,
-                max_anchors=max_anchors,
-                **kwargs,
-            )
-        )
-        predecessor_ids = self._predecessor_ids(input_ids, block_indices)
-
+        hidden: torch.Tensor,
+        unary_logits: torch.Tensor,
+        targets: torch.Tensor,
+        aligned_loss_mask: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+        *,
+        loss_config: LossConfig | None,
+        tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        gamma: float,
+        selector_loss_alpha: float,
+        per_position_loss_weight: str,
+        dpace_alpha: float,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Evaluate unary and selector losses for one objective block."""
         target_ids = targets.argmax(dim=-1)
-        # shape: [1, num_anchors*block_size]
         candidate_ids = unary_logits.topk(self.candidate_selector.top_k, dim=-1).indices
-        # shape: [1, num_anchors*block_size, top_k]
         training_candidate_ids, target_positions, contains_target = (
             selector_training_candidates(candidate_ids, target_ids)
         )
         candidate_logits = self.candidate_selector.score_candidates(
             unary_logits,
             hidden,
-            predecessor_ids.reshape(1, -1),
+            predecessor_ids,
             training_candidate_ids,
         )
-
-        loss, metrics = compute_metrics(
+        return compute_metrics(
             unary_logits=unary_logits,
             targets=targets,
             training_candidate_ids=training_candidate_ids,
@@ -192,4 +175,210 @@ class DFlash2DraftModel(DFlashDraftModel):
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
         )
+
+    def _compute_objective_chunk(
+        self,
+        hidden: torch.Tensor,
+        target_hidden: torch.Tensor,
+        aligned_loss_mask: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+        *,
+        loss_config: LossConfig | None,
+        tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        gamma: float,
+        selector_loss_alpha: float,
+        per_position_loss_weight: str,
+        dpace_alpha: float,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Project and score one anchor chunk.
+
+        The teacher projection is deliberately inside this method so a caller can
+        checkpoint the whole objective chunk and release its [Q, vocab] tensors
+        before moving to the next chunk.
+        """
+        with torch.no_grad():
+            targets = self.verifier_lm_head(target_hidden)
+        unary_logits = self.lm_head(hidden)
+        return self._compute_objective(
+            hidden,
+            unary_logits,
+            targets,
+            aligned_loss_mask,
+            predecessor_ids,
+            loss_config=loss_config,
+            tv_loss_fn=tv_loss_fn,
+            gamma=gamma,
+            selector_loss_alpha=selector_loss_alpha,
+            per_position_loss_weight=per_position_loss_weight,
+            dpace_alpha=dpace_alpha,
+        )
+
+    @staticmethod
+    def _merge_chunk_metrics(
+        total_metrics: dict[str, Any],
+        chunk_metrics: dict[str, Any],
+        valid_count: torch.Tensor,
+        block_valid_count: torch.Tensor,
+    ) -> None:
+        """Merge metrics while preserving the numerator/denominator contract."""
+        mean_names = ("loss", "unary_loss", "selector_loss")
+        for name, value in chunk_metrics.items():
+            metric_value = value
+            if name.endswith("_sum"):
+                metric_name = name[: -len("_sum")]
+                if metric_name in mean_names:
+                    metric_value = value * valid_count
+            if (
+                name.endswith("_total")
+                and name[: -len("_total")] in mean_names
+                or name == "accept_rate_total"
+            ):
+                metric_value = valid_count.to(value.dtype)
+            elif name == "accept_len_total":
+                metric_value = block_valid_count.to(value.dtype)
+            if name in total_metrics:
+                total_metrics[name] = total_metrics[name] + metric_value
+            else:
+                total_metrics[name] = (
+                    metric_value.clone()
+                    if torch.is_tensor(metric_value)
+                    else metric_value
+                )
+
+    @conditional_torch_compile
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # shape: [1, total_seq_len,num_hidden*hidden_size]
+        input_ids: torch.Tensor,  # shape: [1, total_seq_len]
+        loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
+        verifier_last_hidden_states: torch.Tensor,  # shape: [1, total_seq_len, hidden_size] # noqa: E501
+        document_ids: torch.Tensor,  # shape: [1, total_seq_len]
+        position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
+        loss_config: LossConfig | None = None,
+        tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = tv_loss,
+        gamma: float = 4.0,
+        max_anchors: int = 512,
+        objective_chunk_blocks: int = 0,
+        selector_loss_alpha: float = 1.0,
+        per_position_loss_weight: str = "fixed-exp-decay",
+        dpace_alpha: float = 0.5,
+        **kwargs,
+    ) -> tuple[None, torch.Tensor, dict[str, Any]]:
+        if objective_chunk_blocks < 0:
+            raise ValueError("objective_chunk_blocks must be >= 0")
+
+        if objective_chunk_blocks == 0:
+            hidden, unary_logits, targets, aligned_loss_mask, block_indices = (
+                self._backbone_forward(
+                    hidden_states,
+                    input_ids,
+                    loss_mask,
+                    verifier_last_hidden_states,
+                    document_ids,
+                    position_ids,
+                    max_anchors=max_anchors,
+                    **kwargs,
+                )
+            )
+            predecessor_ids = self._predecessor_ids(input_ids, block_indices)
+            loss, metrics = self._compute_objective(
+                hidden,
+                unary_logits,
+                targets,
+                aligned_loss_mask,
+                predecessor_ids.reshape(1, -1),
+                loss_config=loss_config,
+                tv_loss_fn=tv_loss_fn,
+                gamma=gamma,
+                selector_loss_alpha=selector_loss_alpha,
+                per_position_loss_weight=per_position_loss_weight,
+                dpace_alpha=dpace_alpha,
+            )
+            return None, loss, metrics
+
+        hidden, target_hidden, aligned_loss_mask, block_indices = (
+            self._backbone_forward(
+                hidden_states,
+                input_ids,
+                loss_mask,
+                verifier_last_hidden_states,
+                document_ids,
+                position_ids,
+                max_anchors=max_anchors,
+                return_objective_inputs=True,
+                **kwargs,
+            )
+        )
+        predecessor_ids = self._predecessor_ids(input_ids, block_indices).reshape(1, -1)
+        chunk_size = objective_chunk_blocks * self.block_size
+        total_loss_numerator = torch.zeros(
+            (), device=hidden.device, dtype=torch.float32
+        )
+        total_valid = torch.zeros((), device=hidden.device, dtype=torch.float32)
+        metrics: dict[str, Any] = {}
+
+        for start in range(0, hidden.shape[1], chunk_size):
+            end = min(start + chunk_size, hidden.shape[1])
+            hidden_chunk = hidden[:, start:end]
+            target_hidden_chunk = target_hidden[:, start:end]
+            mask_chunk = aligned_loss_mask[:, start:end]
+            predecessor_chunk = predecessor_ids[:, start:end]
+            valid_count = mask_chunk.detach().float().sum()
+            start_pos = 0 if self.config.sample_from_anchor else 1
+            block_valid_count = (
+                mask_chunk.detach()
+                .reshape(-1, self.block_size)[:, start_pos:]
+                .any(dim=-1)
+                .float()
+                .sum()
+            )
+
+            def objective_chunk(
+                chunk_hidden: torch.Tensor,
+                chunk_target_hidden: torch.Tensor,
+                chunk_mask: torch.Tensor = mask_chunk,
+                chunk_predecessor: torch.Tensor = predecessor_chunk,
+            ) -> tuple[torch.Tensor, dict[str, Any]]:
+                return self._compute_objective_chunk(
+                    chunk_hidden,
+                    chunk_target_hidden,
+                    chunk_mask,
+                    chunk_predecessor,
+                    loss_config=loss_config,
+                    tv_loss_fn=tv_loss_fn,
+                    gamma=gamma,
+                    selector_loss_alpha=selector_loss_alpha,
+                    per_position_loss_weight=per_position_loss_weight,
+                    dpace_alpha=dpace_alpha,
+                )
+
+            if torch.is_grad_enabled():
+                chunk_loss, chunk_metrics = checkpoint(
+                    objective_chunk,
+                    hidden_chunk,
+                    target_hidden_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                chunk_loss, chunk_metrics = objective_chunk(
+                    hidden_chunk, target_hidden_chunk
+                )
+            total_loss_numerator = (
+                total_loss_numerator + chunk_loss.float() * valid_count
+            )
+            self._merge_chunk_metrics(
+                metrics, chunk_metrics, valid_count, block_valid_count
+            )
+            total_valid = total_valid + valid_count
+
+        denominator = total_valid.clamp_min(1.0)
+        loss = total_loss_numerator / denominator
+        for name in ("accept_rate_total", "accept_len_total"):
+            if name in metrics:
+                metrics[name] = metrics[name].clamp_min(1.0)
+        for name in ("loss_total", "unary_loss_total", "selector_loss_total"):
+            if name in metrics:
+                metrics[name] = metrics[name].clamp_min(1.0)
+        metrics["loss_sum"] = total_loss_numerator.detach()
+        metrics["loss_total"] = total_valid.detach().clamp_min(1.0)
         return None, loss, metrics

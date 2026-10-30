@@ -382,13 +382,18 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
         document_ids: torch.Tensor,  # [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        return_objective_inputs: bool = False,
         **kwargs,
     ):
         """Run the anchored-block draft transformer up to the draft logits.
 
         Returns ``(hidden, logits, targets, aligned_loss_mask,
-        anchored_block_indices)``. DSpark reuses this and adds its Markov and
-        confidence heads before computing its own loss.
+        anchored_block_indices)``. When ``return_objective_inputs`` is true,
+        returns ``(hidden, target_hidden, aligned_loss_mask,
+        anchored_block_indices)`` instead, leaving the vocabulary projections
+        to the caller so DFlash2 can process objective chunks independently.
+        DSpark reuses this and adds its Markov and confidence heads before
+        computing its own loss.
         """
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
@@ -434,12 +439,20 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )  # shape: [num_anchors*block_size]
 
         with torch.no_grad():
-            if anchored_block_indices.numel() < total_seq_len:
-                target_indices = (
-                    anchored_block_indices
-                    if self.config.sample_from_anchor
-                    else (anchored_block_indices - 1) % total_seq_len
+            target_indices = (
+                anchored_block_indices
+                if self.config.sample_from_anchor
+                else (anchored_block_indices - 1) % total_seq_len
+            )
+            if return_objective_inputs:
+                # DFlash2 projects teacher logits per objective chunk. Returning
+                # normalized teacher features here avoids a full [Q, vocab]
+                # target tensor on the peak-memory path.
+                target_hidden = self.verifier_norm(
+                    verifier_last_hidden_states[:, target_indices]
                 )
+                targets = None
+            elif anchored_block_indices.numel() < total_seq_len:
                 targets = self.verifier_lm_head(
                     self.verifier_norm(verifier_last_hidden_states[:, target_indices])
                 )
@@ -466,6 +479,23 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
         hidden = self.norm(noise_embedding)
+
+        if return_objective_inputs:
+            aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
+            aligned_loss_mask = aligned_loss_mask * (
+                anchor_valid.repeat_interleave(self.block_size)
+                .unsqueeze(0)
+                .to(aligned_loss_mask.dtype)
+            )
+            if not self.config.sample_from_anchor:
+                aligned_loss_mask[:, :: self.block_size] = 0
+            return (
+                hidden,
+                target_hidden,
+                aligned_loss_mask,
+                anchored_block_indices,
+            )
+
         logits = self.lm_head(hidden)
         # shape: [1, num_anchors*block_size, vocab_size]
 

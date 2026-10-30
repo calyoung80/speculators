@@ -27,6 +27,11 @@ PRODUCER_PORT=${2:-18000}
 CONSUMER_NPUS=${3:-2,3}
 LOCAL_HOST_IP=${4:-71.10.29.119}
 NPROC_PER_NODE=${NPROC_PER_NODE:-2}
+NUM_WORKERS=${NUM_WORKERS:-0}
+if [ "${NUM_WORKERS}" != "0" ]; then
+  echo "ERROR: Mooncake TE training requires NUM_WORKERS=0; dataloader multiprocessing can deadlock the TE client." >&2
+  exit 2
+fi
 RUN_ID=$(date +%Y%m%d_%H%M%S)
 SAVE_PATH=${SAVE_PATH:-/mnt/hcs/y00917737/dflash2_cross_node_smoke_ckpt/${RUN_ID}}
 RUN_NAME=${RUN_NAME:-dflash2_cross_node_${RUN_ID}}
@@ -117,7 +122,7 @@ exec torchrun --nproc_per_node="${NPROC_PER_NODE}" --nnodes=1 \
   --conv-kernel-size 2 \
   --selector-rank 256 \
   --selector-top-k 16 \
-  --num-workers ${NUM_WORKERS:-0} \
+  --num-workers "${NUM_WORKERS}" \
   --prefetch-factor 2 \
   --request-timeout 600 \
   --run-name "${RUN_NAME}" \

@@ -184,6 +184,8 @@ torchrun --standalone --nproc_per_node=4 -m speculators.train \
 
 - **`--max-anchors`** (int, default: `512`) Maximum anchor positions for DFlash-family and P-EAGLE training.
 
+- **`--objective-chunk-blocks`** (int, default: `0`) For DFlash2, project and score this many anchor blocks per objective chunk. This reduces peak LM-head/loss activation memory while preserving the existing vocabulary-chunked loss. `0` keeps the full objective path.
+
 - **`--dflash-decay-gamma`** (float, default: `4.0`) Decay gamma for DFlash-family loss weighting.
 
 - **`--per-position-loss-weight`** (str, default: `"dpace"` for dflash, `"fixed-exp-decay"` otherwise) Per-position loss weighting scheme. Options: `fixed-exp-decay`, `dpace`. Applies to DFlash-family models. `dpace` requires `--loss-fn ce`.

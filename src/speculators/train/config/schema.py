@@ -231,6 +231,12 @@ class DataArgs(_Group):
         description="Maximum anchor positions for DFlash-family and P-EAGLE training "
         "(default: 512).",
     )
+    objective_chunk_blocks: int = Field(
+        default=0,
+        ge=0,
+        description="Number of anchor blocks projected through the LM head per "
+        "objective chunk for DFlash2. Zero keeps the full objective path.",
+    )
 
     @field_validator("hidden_states_dtype")
     @classmethod
