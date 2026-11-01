@@ -123,6 +123,7 @@ class TrainerConfig(NamedTuple):
     train_call_kwargs: dict | None = None
     val_call_kwargs: dict | None = None
     optimizer: Literal["adamw", "muon"] = "adamw"
+    optimizer_implementation: Literal["fused", "eager"] = "fused"
     weight_decay: float = 0.01
     muon_lr: float = 0.02
     muon_momentum: float = 0.95
@@ -142,6 +143,8 @@ class TrainerConfig(NamedTuple):
     fsdp_shard: bool = False
     max_steps: int | None = None
     gradient_accumulation_steps: int = 1
+    gradient_checkpointing: bool = False
+    global_token_norm: bool = False
 
 
 def _resolve_scheduler_steps(
@@ -501,7 +504,7 @@ class Trainer:
 
             grad_accum = self.config.gradient_accumulation_steps
             is_sync_step = (local_step_rel % grad_accum == 0) or (local_step_rel == num_steps)
-            sync_context = nullcontext() if is_sync_step else self.model.no_sync()
+            sync_context = nullcontext() if is_sync_step else self.model.no_sync()  # type: ignore[operator]
 
             with sync_context:
                 scaled_loss = loss / grad_accum

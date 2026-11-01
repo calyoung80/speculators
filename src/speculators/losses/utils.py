@@ -318,7 +318,7 @@ def loss_function(
         ``return_token_count`` is True.
     """
     if loss_chunk_size > 0 and _fn_accepts_chunk_size(loss_fn):
-        elementwise_loss = loss_fn(logits, targets, chunk_size=loss_chunk_size)
+        elementwise_loss = loss_fn(logits, targets, chunk_size=loss_chunk_size)  # type: ignore[call-arg]
     else:
         elementwise_loss = loss_fn(logits, targets)  # shape: [1, seq_len]
 

@@ -23,7 +23,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-def wait_for_lock(lock_path: str, timeout: float = 300.0, poll_interval: float = 0.1):
+def wait_for_lock(
+    lock_path: str, timeout: float = 300.0, poll_interval: float = 0.1
+):  # default timeout=300.0
     fd = os.open(lock_path, os.O_RDWR)
     try:
         deadline = time.monotonic() + timeout
@@ -56,9 +58,13 @@ class HiddenStatesTransfer(ABC):
 
     @abstractmethod
     def get_generated(
-        self, hs_transfer_params: dict[str, Any]
+        self, hs_transfer_params: dict[str, Any] | str
     ) -> dict[str, torch.Tensor] | None:
         """Retrieve a sample using vLLM's complete transfer parameters."""
+
+    def cache(self, handle: str, file_idx: int) -> None:  # noqa: B027
+        """Optional cache hook for legacy online-generation callers."""
+        return None
 
     def delete(self, handle: str) -> None:  # noqa: B027
         """Clean up a generated sample (e.g. delete a temp file)."""
@@ -146,9 +152,12 @@ class FileTransfer(HiddenStatesTransfer):
     def get_generated(
         self, hs_transfer_params: dict[str, Any]
     ) -> dict[str, torch.Tensor] | None:
-        handle = hs_transfer_params.get("hidden_states_path") or hs_transfer_params.get(
-            "handle"
-        )
+        if isinstance(hs_transfer_params, str):
+            handle = hs_transfer_params
+        else:
+            handle = hs_transfer_params.get("hidden_states_path") or hs_transfer_params.get(
+                "handle"
+            )
         return _load_hs_file(Path(handle))
 
     def delete(self, handle: str) -> None:
