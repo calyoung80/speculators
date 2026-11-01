@@ -157,7 +157,9 @@ class DFlash2DraftModel(DFlashDraftModel):
         target_ids = targets.argmax(dim=-1)
         candidate_ids = unary_logits.topk(self.candidate_selector.top_k, dim=-1).indices
         training_candidate_ids, target_positions, contains_target = (
-            selector_training_candidates(candidate_ids, target_ids, miss_policy=selector_miss_policy)
+            selector_training_candidates(
+                candidate_ids, target_ids, miss_policy=selector_miss_policy
+            )
         )
         candidate_logits = self.candidate_selector.score_candidates(
             unary_logits,
@@ -293,7 +295,7 @@ class DFlash2DraftModel(DFlashDraftModel):
                 )
             )
             predecessor_ids = self._predecessor_ids(input_ids, block_indices)
-            loss, metrics = self._compute_objective(
+            loss, full_metrics = self._compute_objective(
                 hidden,
                 unary_logits,
                 targets,
@@ -305,8 +307,9 @@ class DFlash2DraftModel(DFlashDraftModel):
                 selector_loss_alpha=selector_loss_alpha,
                 per_position_loss_weight=per_position_loss_weight,
                 dpace_alpha=dpace_alpha,
+                selector_miss_policy=selector_miss_policy,
             )
-            return None, loss, metrics
+            return None, loss, full_metrics
 
         hidden, target_hidden, aligned_loss_mask, block_indices = (
             self._backbone_forward(
@@ -362,6 +365,7 @@ class DFlash2DraftModel(DFlashDraftModel):
                     selector_loss_alpha=selector_loss_alpha,
                     per_position_loss_weight=per_position_loss_weight,
                     dpace_alpha=dpace_alpha,
+                    selector_miss_policy=selector_miss_policy,
                 )
 
             if torch.is_grad_enabled():

@@ -184,6 +184,7 @@ def compute_metrics(
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     selector_miss_policy: str = "replace",
+    loss_chunk_size: int = 0,  # compatibility with the chunked objective caller
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Combine the unary DFlash objective with the selector objective."""
     if selector_miss_policy not in {"replace", "strict"}:

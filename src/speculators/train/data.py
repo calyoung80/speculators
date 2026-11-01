@@ -1,5 +1,4 @@
 import fcntl
-import fcntl
 import logging
 import os
 import threading
@@ -61,17 +60,6 @@ def _online_generation_lock():
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
-
-_ONLINE_GENERATION_LOCK = Path("/tmp/speculators-online-hidden-state-generation.lock")
-
-@contextmanager
-def _online_generation_lock():
-    with _ONLINE_GENERATION_LOCK.open("a+") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def create_empty_sample(
