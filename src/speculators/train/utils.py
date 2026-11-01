@@ -3,14 +3,12 @@ import importlib.metadata
 import logging
 import os
 import shlex
-import subprocess
 import sys
-import tempfile
 import warnings
 from pathlib import Path
 
 from speculators.data_generation.preprocessing import get_tokenizer, load_processor
-from speculators.provenance import find_repo_root
+from speculators.provenance import atomic_write, find_repo_root, git_diff, git_sha
 
 logger = logging.getLogger("speculators")
 
@@ -40,24 +38,36 @@ def resolve_mask_token_id(
     )
     tokenizer = get_tokenizer(processor)
 
-    if tokenizer.mask_token_id is not None:
-        logger.info(f"Using tokenizer mask_token_id={tokenizer.mask_token_id}")
-        return tokenizer.mask_token_id
+    # Not every tokenizer backend defines mask_token_id (MistralCommonBackend
+    # raises AttributeError), so read it like the pad/eos/unk fallbacks below.
+    tokenizer_mask_token_id = getattr(tokenizer, "mask_token_id", None)
+    if tokenizer_mask_token_id is not None:
+        logger.info(f"Using tokenizer mask_token_id={tokenizer_mask_token_id}")
+        return tokenizer_mask_token_id
 
     if len(tokenizer) < vocab_size:
-        tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
-        added_id: int = tokenizer.mask_token_id  # type: ignore[assignment]
-        logger.warning(
-            f"Added <|MASK|> to tokenizer, mask_token_id={added_id} "
-            f"(tokenizer len={len(tokenizer)}, vocab_size={vocab_size})"
-        )
-        return added_id
+        try:
+            tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
+        except NotImplementedError:
+            # MistralCommonBackend can't add tokens; use the fallbacks below.
+            logger.warning(
+                f"{type(tokenizer).__name__} cannot add a <|MASK|> token; "
+                "falling back to pad/eos/unk."
+            )
+        else:
+            added_id: int = tokenizer.mask_token_id  # type: ignore[assignment]
+            logger.warning(
+                f"Added <|MASK|> to tokenizer, mask_token_id={added_id} "
+                f"(tokenizer len={len(tokenizer)}, vocab_size={vocab_size})"
+            )
+            return added_id
 
     for token_name in ("pad_token_id", "eos_token_id", "unk_token_id"):
         token_id = getattr(tokenizer, token_name, None)
         if token_id is not None:
             warnings.warn(
-                f"Tokenizer does not have mask_token and no unused embedding slots. "
+                "Tokenizer has no mask_token and no <|MASK|> token could be added "
+                "(no unused embedding slots, or the tokenizer can't add tokens). "
                 f"Using {token_name}={token_id} as fallback.",
                 stacklevel=2,
             )
@@ -65,7 +75,8 @@ def resolve_mask_token_id(
 
     raise ValueError(
         "Could not resolve mask_token_id: no --mask-token-id provided, tokenizer has "
-        "no mask_token, no unused embedding slots, and no pad/eos/unk fallback tokens."
+        "no mask_token, no <|MASK|> token could be added (no unused embedding slots, "
+        "or the tokenizer can't add tokens), and no pad/eos/unk fallback tokens."
     )
 
 
@@ -101,24 +112,26 @@ def normalize_counted_metrics(
     return metrics
 
 
+def _save_speculators_patch(save_dir: Path, repo_root: Path | None, sha: str) -> None:
+    if repo_root is None:
+        return
+    try:
+        diff = git_diff(repo_root)
+        content = f"# repo: {repo_root} ({sha})\n{diff}"
+        atomic_write(save_dir / "speculators.patch", content)
+    except OSError:
+        logger.warning("Failed to save speculators.patch", exc_info=True)
+
+
 def save_train_command(save_path: str, argv: list[str] | None = None) -> None:
-    """Write the launch command and provenance header to save_path/train_command.txt.
+    """Write train_command.txt and speculators.patch to *save_path*.
 
     ``argv`` is the exact command the run was resolved from (``TrainConfig`` records
     it during resolution); it falls back to the live ``sys.argv`` when a caller has
     no recorded argv, so a direct call is unchanged.
     """
     repo_root = find_repo_root(Path(__file__))
-    try:
-        sha = subprocess.run(
-            ["git", "rev-parse", "HEAD"],  # noqa: S607
-            capture_output=True,
-            text=True,
-            cwd=repo_root,
-            check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        sha = "unknown"
+    sha = git_sha(repo_root)
 
     pkg_versions: list[str] = []
     for pkg in ("speculators", "vllm", "transformers", "torch", "compressed-tensors"):
@@ -130,7 +143,7 @@ def save_train_command(save_path: str, argv: list[str] | None = None) -> None:
 
     header = "\n".join(
         [
-            f"# Timestamp: {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
+            f"# Timestamp: {datetime.datetime.now(datetime.UTC).isoformat()}",
             f"# Git SHA: {sha}",
             f"# World size: {os.environ.get('WORLD_SIZE', '1')}",
             *pkg_versions,
@@ -142,12 +155,5 @@ def save_train_command(save_path: str, argv: list[str] | None = None) -> None:
 
     path = Path(save_path)
     path.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=save_path, prefix=".train_command_", suffix=".tmp")
-    tmp_path = Path(tmp)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(content)
-        tmp_path.replace(path / "train_command.txt")
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
+    atomic_write(path / "train_command.txt", content)
+    _save_speculators_patch(path, repo_root, sha)
