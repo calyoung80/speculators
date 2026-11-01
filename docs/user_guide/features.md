@@ -14,9 +14,9 @@ Draft models use a reduced vocabulary for faster inference. Speculators automati
 
 Training metrics can be logged to TensorBoard, Weights & Biases, TrackIO, and MLflow — individually or simultaneously, so that you can use your preferred experiment tracking tool.
 
-## Automatic Chat Template Detection
+## Automatic Loss Masking
 
-During data preparation, Speculators automatically detects assistant response boundaries to build loss masks. It first tries HuggingFace's native `assistant_tokens_mask` support, then falls back to regex-based pattern detection — including stripping `<think>` blocks from reasoning models. No manual template configuration is needed for most models.
+Loss masks come from the target model's vLLM `/render` endpoint. Each assistant turn is rendered with the serving chat template, and the tokens it adds are supervised. No template configuration is needed. See [prepare_data.py](../cli/prepare_data.md).
 
 ## Performant Flex Attention
 
@@ -40,7 +40,7 @@ Trained models are saved in a special speculators format that vLLM can load dire
 
 ## Model Conversion
 
-Speculators can convert pre-trained models from third-party repositories (EAGLE v1/v2/v3, HASS) into Speculators format for direct deployment with vLLM.
+Speculators can convert pre-trained models from third-party repositories (EAGLE v1/v2/v3, HASS) into Speculators format for direct deployment with vLLM. The EAGLE-3 and DFlash converters accept single-file or indexed sharded checkpoints in safetensors and PyTorch `.bin` formats.
 
 ______________________________________________________________________
 

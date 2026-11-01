@@ -47,13 +47,10 @@ def _masked_decayed_mean(
     loss_mask = loss_mask.to(elementwise.dtype)
     weighted = elementwise * loss_mask
     if decay_fn is not None:
-        decay_mult = decay_fn(
+        weighted = weighted * decay_fn(
             pos_idx.to(weighted.dtype), elementwise_loss=elementwise
         )
-        weighted = weighted * decay_mult
-        denominator = (loss_mask * decay_mult).sum(dim=1) + _EPS
-    else:
-        denominator = loss_mask.sum(dim=1) + _EPS
+    denominator = loss_mask.sum(dim=1) + _EPS
     return (weighted.sum(dim=1) / denominator).mean()
 
 
@@ -112,7 +109,11 @@ def compute_metrics(
         bce = binary_cross_entropy_with_logits(
             confidence_logits, c_star, reduction="none"
         )  # [1, T]
-        conf_loss = _masked_decayed_mean(bce, loss_mask, pos_idx, decay_fn)
+        # D-PACE expects token CE, so keep the confidence BCE on fixed decay.
+        confidence_decay_fn = partial(
+            dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
+        )
+        conf_loss = _masked_decayed_mean(bce, loss_mask, pos_idx, confidence_decay_fn)
         loss = loss + confidence_head_alpha * conf_loss
 
         with torch.no_grad():

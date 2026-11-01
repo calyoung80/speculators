@@ -49,8 +49,14 @@ class DFlash2DraftModel(DFlashDraftModel):
         super().__init__(config=config)
 
         for layer_ in self.layers:
-            assert isinstance(layer_, Qwen3DFlash2DecoderLayer)  # noqa: S101
-            layer_.reset_convolutions()
+            # By capability, so a _make_decoder_layer override still works.
+            reset_convolutions = getattr(layer_, "reset_convolutions", None)
+            if not callable(reset_convolutions):
+                raise TypeError(
+                    f"{type(layer_).__name__} has no reset_convolutions(); a DFlash2 "
+                    "decoder layer must wrap its sublayers in resettable convolutions."
+                )
+            reset_convolutions()
 
         initializer_range = getattr(
             config.transformer_layer_config, "initializer_range", 0.02
@@ -112,6 +118,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             ),
             "dpace_alpha": kwargs.get("dpace_alpha", 0.5),
             "selector_loss_alpha": kwargs.get("selector_loss_alpha", 1.0),
+            "selector_miss_policy": kwargs.get("selector_miss_policy", "replace"),
         }
         return dict(shared), dict(shared)
 
@@ -144,6 +151,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         selector_loss_alpha: float = 1.0,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
+        selector_miss_policy: str = "replace",
         **kwargs,
     ) -> tuple[None, torch.Tensor, dict[str, Any]]:
         hidden, unary_logits, targets, aligned_loss_mask, block_indices = (
@@ -165,7 +173,9 @@ class DFlash2DraftModel(DFlashDraftModel):
         candidate_ids = unary_logits.topk(self.candidate_selector.top_k, dim=-1).indices
         # shape: [1, num_anchors*block_size, top_k]
         training_candidate_ids, target_positions, contains_target = (
-            selector_training_candidates(candidate_ids, target_ids)
+            selector_training_candidates(
+                candidate_ids, target_ids, miss_policy=selector_miss_policy
+            )
         )
         candidate_logits = self.candidate_selector.score_candidates(
             unary_logits,
@@ -191,5 +201,6 @@ class DFlash2DraftModel(DFlashDraftModel):
             selector_loss_alpha=selector_loss_alpha,
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
+            selector_miss_policy=selector_miss_policy,
         )
         return None, loss, metrics

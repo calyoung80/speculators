@@ -185,6 +185,8 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
         conv_group_size: int,
     ) -> None:
         super().__init__(config=config, layer_idx=layer_idx)
+        if config.hidden_size is None:
+            raise ValueError("DFlash2 requires a concrete hidden_size")
         conv_kwargs = {
             "block_size": block_size,
             "kernel_size": conv_kernel_size,

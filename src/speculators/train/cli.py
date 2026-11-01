@@ -1,4 +1,4 @@
-"""Training entrypoint — core logic moved from scripts/train.py."""
+"""Training implementation behind the ``speculators train`` command."""
 
 import argparse
 import gc
@@ -110,6 +110,29 @@ def _maybe_apply_mrope_full_head_hack(
         )
 
 
+# Verifier config attribute names for the final-norm epsilon, in lookup order.
+# NemotronH and Falcon use ``layer_norm_epsilon``; Nemotron and LFM2 ``norm_eps``;
+# Cohere, Phi, StableLM and GPT-NeoX ``layer_norm_eps``; Starcoder2 ``norm_epsilon``.
+_NORM_EPS_ATTRS = (
+    "rms_norm_eps",
+    "layer_norm_epsilon",
+    "norm_eps",
+    "layer_norm_eps",
+    "norm_epsilon",
+)
+
+
+def _resolve_norm_eps(verifier_config: PretrainedConfig) -> float:
+    for attr in _NORM_EPS_ATTRS:
+        eps = getattr(verifier_config, attr, None)
+        if eps is not None:
+            return float(eps)
+    raise AttributeError(
+        f"{type(verifier_config).__name__} has none of {list(_NORM_EPS_ATTRS)}; "
+        "pass --draft-config to set the draft rms_norm_eps explicitly."
+    )
+
+
 def create_transformer_layer_config(  # noqa: C901
     verifier_name_or_path: str,
     num_layers: int,
@@ -120,6 +143,15 @@ def create_transformer_layer_config(  # noqa: C901
     mrope_full_head_hack: bool = True,
     trust_remote_code: bool = False,
 ) -> PretrainedConfig:
+    """Build the draft decoder ``transformer_layer_config`` from shaping flags.
+
+    Used on the default draft-construction path (when neither ``--draft-config``
+    nor ``--from-pretrained`` is given). Attention defaults (``head_dim``,
+    ``num_key_value_heads``, ``hidden_size``) are seeded from the verifier. For
+    heterogeneous verifiers, global values are used as a reasonable automatic
+    default when Transformers reports an ambiguous per-layer attribute; users
+    can provide ``--draft-config`` for explicit values.
+    """
     if draft_arch not in DRAFT_ARCH_CONFIGS:
         raise ValueError(
             f"Unknown draft architecture: {draft_arch}. "
@@ -144,6 +176,20 @@ def create_transformer_layer_config(  # noqa: C901
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
 
+    if getattr(verifier_config, "is_heterogeneous", False) and hasattr(
+        verifier_config, "allow_global_per_layer_attribute_access"
+    ):
+        verifier_config.allow_global_per_layer_attribute_access = True
+        warnings.warn(
+            f"Verifier '{verifier_name_or_path}' has heterogeneous per-layer "
+            "configuration; automatically using global verifier values to "
+            "infer the homogeneous draft config. This is a heuristic; pass "
+            "--draft-config with an explicit decoder config to control these "
+            "values.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     hidden_act = (
         hidden_act
         or getattr(verifier_config, "hidden_act", None)
@@ -158,16 +204,25 @@ def create_transformer_layer_config(  # noqa: C901
     head_dim = getattr(verifier_config, "head_dim", None)
     num_attention_heads = verifier_config.num_attention_heads
     num_key_value_heads = verifier_config.num_key_value_heads
+    resolved_hidden_size = verifier_config.hidden_size
 
     if (
         head_dim
-        and verifier_config.hidden_size % num_attention_heads != 0
-        and verifier_config.hidden_size % head_dim == 0
+        and resolved_hidden_size % num_attention_heads != 0
+        and resolved_hidden_size % head_dim == 0
     ):
-        num_attention_heads = verifier_config.hidden_size // head_dim
+        num_attention_heads = resolved_hidden_size // head_dim
         if num_attention_heads % num_key_value_heads != 0:
             num_key_value_heads = num_attention_heads
-    resolved_head_dim = head_dim or verifier_config.hidden_size // num_attention_heads
+    resolved_head_dim = head_dim or resolved_hidden_size // num_attention_heads
+
+    # Ensure global fallback values are GQA-consistent.
+    if num_key_value_heads and num_attention_heads % num_key_value_heads != 0:
+        raise ValueError(
+            "Inconsistent draft attention geometry resolved from verifier "
+            f"'{verifier_name_or_path}': num_attention_heads={num_attention_heads} "
+            f"is not divisible by num_key_value_heads={num_key_value_heads}."
+        )
 
     if full_attention_indices and (
         min(full_attention_indices) < 0 or max(full_attention_indices) >= num_layers
@@ -183,7 +238,7 @@ def create_transformer_layer_config(  # noqa: C901
 
     config = config_class(
         vocab_size=verifier_config.vocab_size,
-        hidden_size=verifier_config.hidden_size,
+        hidden_size=resolved_hidden_size,
         intermediate_size=resolve_draft_intermediate_size(verifier_config),
         num_hidden_layers=num_layers,
         num_attention_heads=num_attention_heads,
@@ -191,7 +246,7 @@ def create_transformer_layer_config(  # noqa: C901
         hidden_act=hidden_act,
         max_position_embeddings=verifier_config.max_position_embeddings,
         initializer_range=verifier_config.initializer_range,
-        rms_norm_eps=verifier_config.rms_norm_eps,
+        rms_norm_eps=_resolve_norm_eps(verifier_config),
         head_dim=head_dim,
         tie_word_embeddings=False,
         sliding_window=sliding_window,
@@ -687,11 +742,9 @@ def main(cfg: TrainConfig):  # noqa: C901
         data_path=args.data_path,
         total_seq_len=args.total_seq_len,
         hidden_states_dtype=hidden_states_dtype,
-        noise_std=args.noise_std,
         transfer=transfer,
         vllm_endpoint=args.vllm_endpoint,
         on_missing=args.on_missing,
-        on_generate=args.on_generate,
         verifier_name_or_path=args.verifier_name_or_path,
         request_timeout=args.request_timeout,
         max_retries=args.max_retries,
@@ -701,8 +754,10 @@ def main(cfg: TrainConfig):  # noqa: C901
         num_target_layers=num_target_layers,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
+        max_transfer_workers=args.max_transfer_workers,
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
+        seed=args.seed,
     )
 
     # Get trainer kwargs from model class
@@ -716,6 +771,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         train_call_kwargs=train_call_kwargs,
         val_call_kwargs=val_call_kwargs,
         optimizer=args.optimizer,
+        optimizer_implementation=args.optimizer_implementation,
         weight_decay=args.weight_decay,
         muon_lr=args.muon_lr,
         muon_momentum=args.muon_momentum,
@@ -728,11 +784,14 @@ def main(cfg: TrainConfig):  # noqa: C901
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
         checkpoint_freq=args.checkpoint_freq,
+        checkpoint_step_interval=args.checkpoint_step_interval,
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
+        gradient_checkpointing=args.gradient_checkpointing,
         max_steps=args.max_steps,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
