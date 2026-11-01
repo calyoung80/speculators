@@ -1,5 +1,8 @@
 import fcntl
+import fcntl
 import logging
+import os
+import threading
 import time
 import warnings
 from collections.abc import Callable, Sequence
@@ -31,6 +34,33 @@ from speculators.train.recovery import (
 
 BatchType = dict[str, Any]
 logger = logging.getLogger("speculators")
+
+_ONLINE_GENERATION_LOCK = Path("/tmp/speculators-online-hidden-state-generation.lock")
+_ONLINE_GENERATION_CONCURRENCY = int(os.environ.get("SPECULATORS_ONLINE_GENERATION_CONCURRENCY", "0"))
+_ONLINE_GENERATION_LOCK_FORCED = os.environ.get("SPECULATORS_ONLINE_GENERATION_LOCK", "0") == "1"
+_generation_semaphore = (
+    threading.Semaphore(_ONLINE_GENERATION_CONCURRENCY)
+    if _ONLINE_GENERATION_CONCURRENCY > 0 and not _ONLINE_GENERATION_LOCK_FORCED
+    else None
+)
+
+
+@contextmanager
+def _online_generation_lock():
+    if _generation_semaphore is not None:
+        _generation_semaphore.acquire()
+        try:
+            yield
+        finally:
+            _generation_semaphore.release()
+        return
+    with _ONLINE_GENERATION_LOCK.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
 
 _ONLINE_GENERATION_LOCK = Path("/tmp/speculators-online-hidden-state-generation.lock")
 
