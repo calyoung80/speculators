@@ -39,7 +39,7 @@ fi
 echo "[$(hostname -s)] train endpoint=$vllm_endpoint iface=$fabric_iface"
 cd "$repo_root"
 exec torchrun --standalone --nproc-per-node 4 \
-  scripts/train.py \
+  -m speculators.train \
   --verifier-name-or-path "$model_path" \
   --trust-remote-code \
   --draft-config "$script_dir/k3_draft_layer_config.json" \
@@ -74,7 +74,6 @@ exec torchrun --standalone --nproc-per-node 4 \
   --mooncake-writer-threads 4 \
   --vllm-endpoint "$vllm_endpoint" \
   --on-missing generate \
-  --on-generate delete \
   --request-timeout 900 \
   --max-retries 5 \
   --generation-validation-retries 2 \

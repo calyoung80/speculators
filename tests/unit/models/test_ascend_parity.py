@@ -64,7 +64,12 @@ class TestChunkedCeLoss:
         cfg = resolve_loss_config("ce", "eager")
         plain = loss_function(logits, targets, loss_mask, pos_idx, loss_fn=cfg["ce"][0])
         routed = loss_function(
-            logits, targets, loss_mask, pos_idx, loss_fn=cfg["ce"][0], loss_chunk_size=16
+            logits,
+            targets,
+            loss_mask,
+            pos_idx,
+            loss_fn=cfg["ce"][0],
+            loss_chunk_size=16,
         )
         torch.testing.assert_close(plain, routed, rtol=0, atol=1e-6)
 
@@ -200,11 +205,20 @@ class TestAnchorBlockFloatMask:
         )
 
         mod, q, k = create_anchor_block_mask_mod(
-            doc, total, anchors, block_size=bs,
-            sliding_window=sw, sliding_window_non_causal=swnc,
+            doc,
+            total,
+            anchors,
+            block_size=bs,
+            sliding_window=sw,
+            sliding_window_non_causal=swnc,
         )
         return create_float_mask(
-            mod, B=None, H=None, Q_LEN=q, KV_LEN=k, device="cpu",
+            mod,
+            B=None,
+            H=None,
+            Q_LEN=q,
+            KV_LEN=k,
+            device="cpu",
             dtype=torch.float32,
         )
 
@@ -215,8 +229,12 @@ class TestAnchorBlockFloatMask:
             for swnc in (False, True):
                 ref = self._reference(doc, 12, anchors, 4, sw, swnc)
                 out = build_anchor_block_float_mask(
-                    doc, 12, anchors, block_size=4,
-                    sliding_window=sw, sliding_window_non_causal=swnc,
+                    doc,
+                    12,
+                    anchors,
+                    block_size=4,
+                    sliding_window=sw,
+                    sliding_window_non_causal=swnc,
                     dtype=torch.float32,
                 )
                 torch.testing.assert_close(out, ref, rtol=0, atol=0)
@@ -228,8 +246,13 @@ class TestAnchorBlockFloatMask:
         anchors = torch.tensor([2, 6])
         for swnc in (False, True):
             m = build_anchor_block_float_mask(
-                doc, 8, anchors, block_size=4, sliding_window=2,
-                sliding_window_non_causal=swnc, dtype=torch.float32,
+                doc,
+                8,
+                anchors,
+                block_size=4,
+                sliding_window=2,
+                sliding_window_non_causal=swnc,
+                dtype=torch.float32,
             )
             for q in range(8):
                 kv = 8 + q
@@ -266,8 +289,13 @@ class TestAnchorBlockFloatMask:
             swnc = bool(torch.randint(0, 2, (1,)).item())
             ref = self._reference(doc, t, anchors, bs, sw, swnc)
             out = build_anchor_block_float_mask(
-                doc, t, anchors, block_size=bs, sliding_window=sw,
-                sliding_window_non_causal=swnc, dtype=torch.float32,
+                doc,
+                t,
+                anchors,
+                block_size=bs,
+                sliding_window=sw,
+                sliding_window_non_causal=swnc,
+                dtype=torch.float32,
             )
             torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
@@ -361,6 +389,9 @@ class TestOnlineGenerationConcurrency:
 
         tr_src = Path(tr.__file__).read_text()
         assert "timeout=300.0" in tr_src
+
+
+class TestGlobalGradientTokenNorm:
     """E3 parity #4b: gradients (not just metrics) are token-normalized.
 
     With DDP averaging, backwarding L_r = S_r/N_r lets token-poor ranks
@@ -369,7 +400,6 @@ class TestOnlineGenerationConcurrency:
         of the global token-weighted loss sum(S)/sum(N).
     """
 
-class TestGlobalGradientTokenNorm:
     def test_rescale_math(self):
         world = 2
         n_r = [100.0, 8.0]  # 12.5x imbalance
@@ -379,7 +409,7 @@ class TestGlobalGradientTokenNorm:
         # new: trainer rescales the loss to S_r * (N_r*R/N_total) = S_r * R/N_total;
         # DDP-averaged gradient coefficient on dS_r becomes 1/N_total for both ranks.
         s_r = [torch.tensor(v, requires_grad=True) for v in (50.0, 5.0)]
-        for s, n in zip(s_r, n_r):
+        for s, n in zip(s_r, n_r, strict=True):
             loss = s / n  # per-rank mean, as the model returns it
             rescaled = loss * (n * world / n_total)  # trainer.py factor
             rescaled.backward()

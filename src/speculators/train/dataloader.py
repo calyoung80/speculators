@@ -59,6 +59,7 @@ def _setup_dataloader(
     prefetch_factor: int | None = 4,
     preprocess: Callable[[BatchType], BatchType] | None = None,
     max_batches: int | None = None,
+    seed: int = 0,
 ) -> DataLoader:
     batch_sampler = MultipackDistributedBatchSamplerV2(
         batch_max_length=total_seq_len,
@@ -66,18 +67,15 @@ def _setup_dataloader(
         num_replicas=get_dp_size(),
         rank=get_dp_rank(),
         max_batches=max_batches,
+        seed=seed,
     )
     use_workers = num_workers > 0
-    # Pinned host memory interacts badly with some accelerator runtimes
-    # (observed shm/pin deadlocks with Mooncake TE on Ascend NPU), so the
-    # default is False but can be re-enabled per deployment via env.
-    pin_memory = os.environ.get("DATALOADER_PIN_MEMORY", "0") == "1"
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if use_workers else None,
-        pin_memory=pin_memory,
+        pin_memory=False,
         collate_fn=CollateFn(
             total_seq_len,
             hidden_size,
@@ -96,11 +94,11 @@ def create_train_val_loaders(
     data_path: str,
     total_seq_len: int,
     hidden_states_dtype: torch.dtype,
-    noise_std: float,
+    noise_std: float = 0.0,
     transfer: HiddenStatesTransfer | None = None,
     vllm_endpoint: str,
     on_missing: Literal["generate", "skip", "warn", "raise"],
-    on_generate: Literal["cache", "delete"],
+    on_generate: Literal["cache", "delete"] = "delete",
     verifier_name_or_path: str,
     request_timeout: float | None,
     max_retries: int,
@@ -113,6 +111,8 @@ def create_train_val_loaders(
     preprocess: Callable[[BatchType], BatchType] | None,
     train_data_ratio: float = 0.9,
     max_train_batches: int | None = None,
+    max_transfer_workers: int = 4,
+    seed: int = 0,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -121,6 +121,8 @@ def create_train_val_loaders(
     :mod:`speculators.train.distributed`.
     """
     _limit_worker_threads()
+    if max_transfer_workers <= 0:
+        raise ValueError("max_transfer_workers must be > 0")
     noise_transform = AddUniformNoise(std=noise_std)
 
     if not (0.0 < train_data_ratio < 1.0):
@@ -176,6 +178,7 @@ def create_train_val_loaders(
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
         max_batches=max_train_batches,
+        seed=seed,
     )
     val_loader = _setup_dataloader(
         val_dataset,

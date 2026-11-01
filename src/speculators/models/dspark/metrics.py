@@ -4,11 +4,6 @@ loss = compound_loss(logits, targets) + conf_alpha * BCE(confidence, accept_rate
 
 The confidence target ``accept_rate = sum_v min(q_v, p_v) = 1 - d_TV`` is the
 analytical acceptance rate (the overlap ``tv_loss`` already computes).
-
-Two acceptance lengths are reported, both counting the verifier's bonus token:
-``accept_len`` from that analytical rate (acceptance under rejection sampling)
-and ``eal`` from greedy argmax matches (acceptance at temperature 0, and the
-value comparable across the DFlash family).
 """
 
 from collections.abc import Callable
@@ -25,10 +20,7 @@ from speculators.losses import (
     dpace_loss_decay,
     tv_loss,
 )
-from speculators.models.metrics import (
-    compute_accepted_length_counts,
-    compute_accuracy_multi_step,
-)
+from speculators.models.metrics import compute_accuracy_multi_step
 
 __all__ = [
     "compute_metrics",
@@ -68,7 +60,6 @@ def compute_metrics(
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = True,
-    loss_chunk_size: int = 0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -89,13 +80,7 @@ def compute_metrics(
         )
 
     loss, term_losses = compound_loss(
-        logits,
-        targets,
-        loss_mask,
-        pos_idx,
-        loss_config=loss_config,
-        decay_fn=decay_fn,
-        loss_chunk_size=loss_chunk_size,
+        logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn
     )
 
     # Analytical per-position acceptance rate = distributional overlap
@@ -145,19 +130,7 @@ def compute_metrics(
 
     ones = torch.ones((), device=device)
     metrics["loss_sum"] = loss.detach().clone()
-    # True token-weighted denominator so that, after the trainer's cross-rank
-    # sum-reduction, the logged loss is the global token-weighted mean rather
-    # than a mean of per-rank means (which over-weights token-poor ranks).
-    token_count = term_losses.pop("__token_count__", None)
-    metrics["loss_total"] = (
-        token_count.to(device).clamp_min(1.0)
-        if token_count is not None
-        else ones
-    )
-    if token_count is not None:
-        # Live token count for the trainer's gradient-normalization
-        # all-reduce (popped before metric reduction; see trainer.py).
-        metrics["__loss_token_count__"] = token_count.to(device)
+    metrics["loss_total"] = ones
     for term_name, term_val in term_losses.items():
         metrics[f"{term_name}_sum"] = term_val
         metrics[f"{term_name}_total"] = ones.clone()
@@ -169,7 +142,7 @@ def compute_metrics(
         metrics["accept_rate_total"] = mask_f.sum().clamp_min(1.0)
 
     # Expected accepted draft length per block (DSpark's tau): the cumulative
-    # acceptance product summed over draft slots, plus the always-emitted bonus.
+    # acceptance product summed over draft slots, plus the always-emitted anchor.
     with torch.no_grad():
         per_block_len = accept_prefix.sum(dim=-1) + 1.0
         block_valid = (draft_mask.sum(dim=-1) > 0).to(accept_rate.dtype)
@@ -187,14 +160,5 @@ def compute_metrics(
     for pos in range(start_pos, block_size):
         metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
         metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
-
-    # Greedy counterpart to accept_len, on the same per-block/bonus-token
-    # convention, so DFlash-family runs compare on one number.
-    eal_sum, eal_total = compute_accepted_length_counts(
-        (pred_ids == target_ids).reshape(num_blocks, block_size)[:, start_pos:],
-        draft_mask.to(torch.bool),
-    )
-    metrics["eal_sum"] = eal_sum
-    metrics["eal_total"] = eal_total
 
     return loss, metrics
