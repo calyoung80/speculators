@@ -6,9 +6,7 @@ This design is based on the runtime repository:
 /mnt/hcs/y00917737/te_dspark_submission/speculators
 ```
 
-It targets the current Ascend `mooncake-te` path and keeps the existing
-training semantics. The design is not a proposal to replace it with the
-ordinary CPU/payload `mooncake` backend.
+It targets the current Ascend `mooncake-te` path and keeps the existing training semantics. The design is not a proposal to replace it with the ordinary CPU/payload `mooncake` backend.
 
 ## Design Decision
 
@@ -33,11 +31,9 @@ multi-Producer pool + direct TE payload transfer
 checkpoint-boundary night/day controller
 ```
 
-`P` means a vLLM hidden-state Producer replica. `T` means a Trainer process
-group, not an individual process.
+`P` means a vLLM hidden-state Producer replica. `T` means a Trainer process group, not an individual process.
 
-The first implementation must not combine all changes. Each stage needs to
-answer one performance question and preserve the previous stage as a baseline.
+The first implementation must not combine all changes. Each stage needs to answer one performance question and preserve the previous stage as a baseline.
 
 ## Community Work Mapping
 
@@ -54,27 +50,21 @@ Reuse these ideas:
 - failure accounting;
 - no global progress barrier between consumers.
 
-Do not copy its POSIX artifact implementation into the Ascend TE path. Replace
-the artifact lease with a TE request lease and ACK state.
+Do not copy its POSIX artifact implementation into the Ascend TE path. Replace the artifact lease with a TE request lease and ACK state.
 
 ### PR #605: Mooncake hidden-state transfer
 
 <https://github.com/vllm-project/speculators/pull/605>
 
-Reuse its request-id-keyed transfer contract. The current runtime already has
-the same broad shape: HTTP returns a request handle, and the Consumer resolves
-that handle through a Mooncake store.
+Reuse its request-id-keyed transfer contract. The current runtime already has the same broad shape: HTTP returns a request handle, and the Consumer resolves that handle through a Mooncake store.
 
-The missing pieces left by that prototype are exactly the pieces this design
-adds: Trainer-side prefetch and Producer fleet scheduling.
+The missing pieces left by that prototype are exactly the pieces this design adds: Trainer-side prefetch and Producer fleet scheduling.
 
 ### PR #710: multi-node Mooncake TCP/RDMA
 
 <https://github.com/vllm-project/speculators/pull/710>
 
-Use as transport reference only. It is not a validated dependency for the
-current branch. The current production experiment uses the local Ascend
-TransferEngine implementation in `mooncake_te_*`.
+Use as transport reference only. It is not a validated dependency for the current branch. The current production experiment uses the local Ascend TransferEngine implementation in `mooncake_te_*`.
 
 ### PR #967: checksummed manifest and recovery
 
@@ -88,27 +78,19 @@ Reuse its correctness requirements:
 - checksum or equivalent identity validation;
 - explicit failure manifest and retry accounting.
 
-For `mooncake-te`, checksum validation must not become an extra full-size copy
-on the critical path unless enabled for validation mode. Shape, token count,
-Producer identity, and ACK ownership are mandatory in production; checksum can
-be sampled or required in correctness tests.
+For `mooncake-te`, checksum validation must not become an extra full-size copy on the critical path unless enabled for validation mode. Shape, token count, Producer identity, and ACK ownership are mandatory in production; checksum can be sampled or required in correctness tests.
 
 ### PR #972: multi-node Trainer example
 
 <https://github.com/vllm-project/speculators/pull/972>
 
-Reuse its explicit multi-node launch model and Slurm wiring. It demonstrates
-multi-node extraction plus a Trainer group, but does not provide elastic FSDP
-world-size changes or multi-Producer routing.
+Reuse its explicit multi-node launch model and Slurm wiring. It demonstrates multi-node extraction plus a Trainer group, but does not provide elastic FSDP world-size changes or multi-Producer routing.
 
 ### PR #1013: scale-out render front end
 
 <https://github.com/vllm-project/speculators/pull/1013>
 
-Reuse its measured bounded-concurrency approach. Its `api-server-count` and
-`renderer-num-workers` scale the render/tokenization front end; they do not
-scale the hidden-state TE Producer. The distinction must remain explicit in
-the launcher and metrics.
+Reuse its measured bounded-concurrency approach. Its `api-server-count` and `renderer-num-workers` scale the render/tokenization front end; they do not scale the hidden-state TE Producer. The distinction must remain explicit in the launcher and metrics.
 
 ## Current Runtime Path
 
@@ -137,16 +119,11 @@ sequenceDiagram
     T->>T: forward/backward/optimizer
 ```
 
-The current formal launcher uses `num_workers=0`, `--nnodes=1`, and one
-Producer IP/endpoint. DataLoader's existing `prefetch_factor` is not training
-request prefetch: it only controls batches already produced by DataLoader
-workers, and using NPU TE operations from forked/spawned workers is not a safe
-substitute for a Trainer-owned TE scheduler.
+The current formal launcher uses `num_workers=0`, `--nnodes=1`, and one Producer IP/endpoint. DataLoader's existing `prefetch_factor` is not training request prefetch: it only controls batches already produced by DataLoader workers, and using NPU TE operations from forked/spawned workers is not a safe substitute for a Trainer-owned TE scheduler.
 
 ## Target Interfaces
 
-The interfaces below are contracts. Names can be adjusted during coding, but
-the ownership and state transitions should not be weakened.
+The interfaces below are contracts. Names can be adjusted during coding, but the ownership and state transitions should not be weakened.
 
 ### Producer endpoint
 
@@ -161,9 +138,7 @@ class ProducerEndpoint:
     max_in_flight: int = 1
 ```
 
-The endpoint is configuration and identity, not just a URL. All replicas in a
-pool must pass the same model, layer IDs, context length, image ID, connector
-revision, and TE protocol preflight.
+The endpoint is configuration and identity, not just a URL. All replicas in a pool must pass the same model, layer IDs, context length, image ID, connector revision, and TE protocol preflight.
 
 ### Producer pool
 
@@ -193,9 +168,7 @@ class ProducerHealth:
     last_error: str | None
 ```
 
-`acquire()` must use least-in-flight with a deterministic tie-breaker, not
-blind round-robin. It must refuse a draining or unhealthy Producer. The pool
-does not proxy hidden-state payloads.
+`acquire()` must use least-in-flight with a deterministic tie-breaker, not blind round-robin. It must refuse a draining or unhealthy Producer. The pool does not proxy hidden-state payloads.
 
 ### Request state
 
@@ -226,14 +199,11 @@ class HiddenStateRequest:
     error: str | None = None
 ```
 
-The same logical sample must not be concurrently assigned to two Producers.
-Duplicate requests are coalesced by `request_key`; this is the direct
-application of PR #811's duplicate-miss rule.
+The same logical sample must not be concurrently assigned to two Producers. Duplicate requests are coalesced by `request_key`; this is the direct application of PR #811's duplicate-miss rule.
 
 ### TE metadata contract
 
-The current metadata should be extended from an unqualified Producer address
-to an ownership-bearing manifest:
+The current metadata should be extended from an unqualified Producer address to an ownership-bearing manifest:
 
 ```json
 {
@@ -255,10 +225,7 @@ to an ownership-bearing manifest:
 }
 ```
 
-Publication remains atomic: write a temporary manifest, fsync if required by
-the selected metadata filesystem, then rename to the final marker. The
-Consumer must reject a mismatched `request_key`, `producer_id`, shape, or token
-count.
+Publication remains atomic: write a temporary manifest, fsync if required by the selected metadata filesystem, then rename to the final marker. The Consumer must reject a mismatched `request_key`, `producer_id`, shape, or token count.
 
 ### TE store ownership API
 
@@ -274,24 +241,18 @@ class MooncakeTEStore(Protocol):
     def release(self, lease: HiddenStateLease) -> None: ...
 ```
 
-The implementation may continue to use the current `.json` and `.ack` files,
-but their names must be namespace-qualified when multiple Producers share a
-metadata root:
+The implementation may continue to use the current `.json` and `.ack` files, but their names must be namespace-qualified when multiple Producers share a metadata root:
 
 ```text
 <TE_META_ROOT>/<producer_id>/<request_key>.json
 <TE_META_ROOT>/<producer_id>/<request_key>.ack
 ```
 
-The current `_prev_te_key` single-request ACK guard cannot be removed until a
-per-request buffer/ring ownership scheme is proven. A safe first multi-request
-implementation may keep one in-flight request per Producer while allowing
-different Producers to work concurrently.
+The current `_prev_te_key` single-request ACK guard cannot be removed until a per-request buffer/ring ownership scheme is proven. A safe first multi-request implementation may keep one in-flight request per Producer while allowing different Producers to work concurrently.
 
 ## Prefetch Scheduler
 
-The scheduler is the first new training-side component. It should sit above the
-current sample generation and below the Trainer's batch iterator.
+The scheduler is the first new training-side component. It should sit above the current sample generation and below the Trainer's batch iterator.
 
 ```mermaid
 flowchart TD
@@ -316,10 +277,7 @@ lookahead batches:              1
 Producer replicas:              1
 ```
 
-Only after correctness passes should the experiment set `max_in_flight=2`.
-If the current Producer's single send buffer and ACK guard cannot support that,
-the scheduler must remain at one request per Producer and only overlap safe
-CPU/request preparation with Trainer compute.
+Only after correctness passes should the experiment set `max_in_flight=2`. If the current Producer's single send buffer and ACK guard cannot support that, the scheduler must remain at one request per Producer and only overlap safe CPU/request preparation with Trainer compute.
 
 The scheduler must expose:
 
@@ -331,13 +289,11 @@ class PrefetchScheduler(Protocol):
     async def drain(self, *, timeout: float) -> None: ...
 ```
 
-`get()` may block for the requested sample, but it should not submit the
-request synchronously if the request was already placed in the lookahead queue.
+`get()` may block for the requested sample, but it should not submit the request synchronously if the request was already placed in the lookahead queue.
 
 ## Metrics Contract
 
-Every request and every training step should report the following where
-available:
+Every request and every training step should report the following where available:
 
 ```text
 queue_wait_ms
@@ -354,8 +310,7 @@ bwd_ms
 opt_ms
 ```
 
-The old `fetch_ms` remains for compatibility, but the new fields determine the
-bottleneck. Producer metrics should additionally report:
+The old `fetch_ms` remains for compatibility, but the new fields determine the bottleneck. Producer metrics should additionally report:
 
 ```text
 in_flight
@@ -368,8 +323,7 @@ te_publish_errors
 
 ## Multi-Trainer Launcher Interface
 
-The current `start_train_te_dflash2.sh` hard-codes `--nnodes=1`. Replace that
-with a profile-driven launcher:
+The current `start_train_te_dflash2.sh` hard-codes `--nnodes=1`. Replace that with a profile-driven launcher:
 
 ```text
 NNODES=2
@@ -383,14 +337,11 @@ The launcher should validate:
 
 - all nodes use the same code revision and immutable image ID;
 - all nodes see the same dataset and checkpoint path;
-- `world_size = NNODES * NPROC_PER_NODE` is compatible with the selected
-  `sp_size`;
-- the TE initialization happens before HCCL on each rank as required by the
-  current Ascend path;
+- `world_size = NNODES * NPROC_PER_NODE` is compatible with the selected `sp_size`;
+- the TE initialization happens before HCCL on each rank as required by the current Ascend path;
 - Producer endpoint and TE metadata namespace are available from every node.
 
-Start with one Producer and one multi-node Trainer group. This isolates FSDP
-scaling from Producer-pool scaling.
+Start with one Producer and one multi-node Trainer group. This isolates FSDP scaling from Producer-pool scaling.
 
 ## Night/Day Profiles
 
@@ -408,10 +359,7 @@ profiles:
     producer_max_in_flight: 1
 ```
 
-The first night profile should actually use `producer_replicas: 1` until the
-multi-Trainer experiment shows that the single Producer is saturated. The
-configuration above describes the eventual shape, not an immediate launch
-recommendation.
+The first night profile should actually use `producer_replicas: 1` until the multi-Trainer experiment shows that the single Producer is saturated. The configuration above describes the eventual shape, not an immediate launch recommendation.
 
 ```mermaid
 flowchart TD
@@ -427,8 +375,7 @@ flowchart TD
     I --> J[resume same run directory]
 ```
 
-The handoff is always a restart at a checkpoint boundary. No live mutation of
-the distributed process group is required.
+The handoff is always a restart at a checkpoint boundary. No live mutation of the distributed process group is required.
 
 ## Implementation Tasks
 
@@ -443,8 +390,7 @@ Files:
 
 Add timings and request identity logging without changing scheduling.
 
-Acceptance: current training produces stage timings and remains numerically
-equivalent.
+Acceptance: current training produces stage timings and remains numerically equivalent.
 
 ### T1: single-Producer scheduler
 
@@ -455,11 +401,9 @@ Files:
 - `src/speculators/data_generation/vllm_client.py`
 - training config schema/CLI
 
-Add async HTTP submission, one-request lookahead, duplicate coalescing, and
-drain. Keep the default disabled.
+Add async HTTP submission, one-request lookahead, duplicate coalescing, and drain. Keep the default disabled.
 
-Acceptance: 50-200 step smoke and several-hundred-step A/B show lower fetch
-wait without OOM, ACK timeout growth, stale metadata, or metric drift.
+Acceptance: 50-200 step smoke and several-hundred-step A/B show lower fetch wait without OOM, ACK timeout growth, stale metadata, or metric drift.
 
 ### T2: safe TE request ownership
 
@@ -469,9 +413,7 @@ Files:
 - `hs_connectors/src/hs_connectors/mooncake_te_connector.py`
 - unit/integration TE contract tests
 
-Add versioned metadata, Producer identity, namespace, lease state, and explicit
-ACK/release tests. Preserve the current ACK barrier until a ring-buffer design
-is validated.
+Add versioned metadata, Producer identity, namespace, lease state, and explicit ACK/release tests. Preserve the current ACK barrier until a ring-buffer design is validated.
 
 ### T3: multi-node Trainer
 
@@ -479,11 +421,9 @@ Files:
 
 - `deploy/start_train_te_dflash2.sh`
 - `deploy/start_cross_node_roce_smoke.sh`
-- a new profile/topology launcher, or the existing Kimi-K3 launcher adapted for
-  Ascend TE
+- a new profile/topology launcher, or the existing Kimi-K3 launcher adapted for Ascend TE
 
-Add `NNODES`, `NODE_RANK`, `MASTER_ADDR`, and `MASTER_PORT`. Validate FSDP
-checkpoint resume at the intended world sizes.
+Add `NNODES`, `NODE_RANK`, `MASTER_ADDR`, and `MASTER_PORT`. Validate FSDP checkpoint resume at the intended world sizes.
 
 ### T4: ProducerPool
 
@@ -494,28 +434,23 @@ Files:
 - `hs_connectors` metadata/TE ownership implementation
 - deployment profile and health checks
 
-Start with one request per Producer. Scale across Producers before increasing
-per-Producer concurrency. This avoids repeating the historical single-Producer
-8K `MAX_NUM_SEQS=2` OOM failure.
+Start with one request per Producer. Scale across Producers before increasing per-Producer concurrency. This avoids repeating the historical single-Producer 8K `MAX_NUM_SEQS=2` OOM failure.
 
 ## Acceptance Matrix
 
-| Stage | Producer | Trainer | Main question | Required result |
-| --- | --- | --- | --- | --- |
-| T0 | 1 | current 2 ranks | Where is fetch time? | stage metrics, no regression |
-| T1 | 1 | current 2 ranks | Does lookahead hide wait? | lower fetch/step time, safe ACK |
-| T2 | 1 | current 2 ranks | Is TE ownership safe? | no stale/overwritten payload |
-| T3 | 1 | multi-node FSDP | Does compute scale? | lower compute time without fetch collapse |
-| T4 | 2+ | multi-node FSDP | Does fleet scale? | throughput improves with bounded errors |
-| T5 | profile-based | profile-based | Can night/day switch? | checkpoint-boundary resume |
+| Stage | Producer      | Trainer         | Main question             | Required result                           |
+| ----- | ------------- | --------------- | ------------------------- | ----------------------------------------- |
+| T0    | 1             | current 2 ranks | Where is fetch time?      | stage metrics, no regression              |
+| T1    | 1             | current 2 ranks | Does lookahead hide wait? | lower fetch/step time, safe ACK           |
+| T2    | 1             | current 2 ranks | Is TE ownership safe?     | no stale/overwritten payload              |
+| T3    | 1             | multi-node FSDP | Does compute scale?       | lower compute time without fetch collapse |
+| T4    | 2+            | multi-node FSDP | Does fleet scale?         | throughput improves with bounded errors   |
+| T5    | profile-based | profile-based   | Can night/day switch?     | checkpoint-boundary resume                |
 
 ## Non-Goals
 
-- Do not use ordinary `mooncake` async writer settings as proof that
-  `mooncake-te` is asynchronously safe.
+- Do not use ordinary `mooncake` async writer settings as proof that `mooncake-te` is asynchronously safe.
 - Do not route hidden-state payloads through an HTTP proxy.
-- Do not remove ACK synchronization based only on performance measurements;
-  it protects against KV cache block reuse races.
-- Do not assume an FSDP checkpoint can change world size until the actual
-  Ascend path has passed a resume test.
+- Do not remove ACK synchronization based only on performance measurements; it protects against KV cache block reuse races.
+- Do not assume an FSDP checkpoint can change world size until the actual Ascend path has passed a resume test.
 - Do not modify the active formal run to test T1-T5.

@@ -186,22 +186,22 @@ Training epoch 1/1 completed
 
 ### 训练配置说明
 
-| 参数                      | 值                       | 说明                          |
-| ------------------------- | ------------------------ | ----------------------------- |
-| ASCEND_RT_VISIBLE_DEVICES | 6,7                      | NPU 6,7                       |
-| --speculator-type         | dspark                   | DFlash base + Markov head     |
-| --hidden-states-backend   | mooncake-te              | TE 后端                       |
-| --mooncake-te-producer-ip | 127.0.0.1                | 本机 vLLM                     |
-| --vllm-endpoint           | http://127.0.0.1:8000/v1 | vLLM API                      |
-| --target-layer-ids        | 3 19 35                  | 与 vLLM 一致                  |
-| --total-seq-len           | 8192                     | 序列长度                      |
-| --block-size              | 7                        | DFlash block 大小             |
-| --markov-rank             | 256                      | Markov 矩阵秩                 |
-| --enable-confidence-head  | (flag)                   | 启用 confidence head          |
-| --loss-fn                 | {"ce":0.1,"tv":0.9}      | CE + TV loss                  |
-| --max-steps               | 1                        | 最大步数 (改为 10 做更长训练) |
-| --epochs                  | 1                        | 训练轮数                      |
-| --lr                      | 1e-4                     | 学习率                        |
+| 参数                      | 值                         | 说明                          |
+| ------------------------- | -------------------------- | ----------------------------- |
+| ASCEND_RT_VISIBLE_DEVICES | 6,7                        | NPU 6,7                       |
+| --speculator-type         | dspark                     | DFlash base + Markov head     |
+| --hidden-states-backend   | mooncake-te                | TE 后端                       |
+| --mooncake-te-producer-ip | 127.0.0.1                  | 本机 vLLM                     |
+| --vllm-endpoint           | `http://127.0.0.1:8000/v1` | vLLM API                      |
+| --target-layer-ids        | 3 19 35                    | 与 vLLM 一致                  |
+| --total-seq-len           | 8192                       | 序列长度                      |
+| --block-size              | 7                          | DFlash block 大小             |
+| --markov-rank             | 256                        | Markov 矩阵秩                 |
+| --enable-confidence-head  | (flag)                     | 启用 confidence head          |
+| --loss-fn                 | {"ce":0.1,"tv":0.9}        | CE + TV loss                  |
+| --max-steps               | 1                          | 最大步数 (改为 10 做更长训练) |
+| --epochs                  | 1                          | 训练轮数                      |
+| --lr                      | 1e-4                       | 学习率                        |
 
 ______________________________________________________________________
 

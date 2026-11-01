@@ -1,17 +1,10 @@
 # DFlash2 多 Producer / 多 Trainer 分析
 
-本文档基于实际运行仓库
-`/mnt/hcs/y00917737/te_dspark_submission/speculators` 的当前代码分析，
-不是基于工作区副本。当前代码基线为分支 `dflash2-ascend`、提交
-`5f80834`。仓库中已有未提交的 Ascend/TE 修改和备份文件，本文不覆盖或
-撤销这些现有改动。
+本文档基于实际运行仓库 `/mnt/hcs/y00917737/te_dspark_submission/speculators` 的当前代码分析， 不是基于工作区副本。当前代码基线为分支 `dflash2-ascend`、提交 `5f80834`。仓库中已有未提交的 Ascend/TE 修改和备份文件，本文不覆盖或 撤销这些现有改动。
 
 ## 结论先行
 
-当前正式训练的主要问题不是“缺少几个 Producer 进程”这么简单。实际代码
-是一个**同步取数的训练循环**：Trainer 取一个 batch 时，如果 hidden states
-不存在，就在当前 Trainer 进程中同步调用一个 vLLM endpoint，等待 Producer
-完成并通过 Mooncake TE 取回数据，然后才能进入模型 forward。
+当前正式训练的主要问题不是“缺少几个 Producer 进程”这么简单。实际代码 是一个**同步取数的训练循环**：Trainer 取一个 batch 时，如果 hidden states 不存在，就在当前 Trainer 进程中同步调用一个 vLLM endpoint，等待 Producer 完成并通过 Mooncake TE 取回数据，然后才能进入模型 forward。
 
 当前可执行的改造顺序是：
 
@@ -20,8 +13,7 @@
 3. 再将 Trainer 扩展为多节点 FSDP。
 4. 只有单 Producer 被证实为瓶颈后，才增加 Producer pool 和请求路由。
 
-不能把仓库中已有的离线数据生成异步代码直接当成训练时异步预取。两者
-使用场景不同。
+不能把仓库中已有的离线数据生成异步代码直接当成训练时异步预取。两者 使用场景不同。
 
 ## 实际代码链路
 
@@ -31,10 +23,8 @@
 
 - 初始化时保存一个 `vllm_endpoint` 和一个同步 `openai.OpenAI` client；
 - `_get_raw_data()` 先按 file index 查找缓存；
-- cache miss 且 `on_missing=generate` 时，调用
-  `_generate_hidden_states_once()`；
-- `_generate_hidden_states_once()` 调用同步的
-  `generate_hidden_states()`；
+- cache miss 且 `on_missing=generate` 时，调用 `_generate_hidden_states_once()`；
+- `_generate_hidden_states_once()` 调用同步的 `generate_hidden_states()`；
 - HTTP 返回 handle 后，调用 `self.transfer.get_generated(handle)`；
 - 校验 hidden states 和 token IDs 后删除 handle；
 - 返回样本，DataLoader 才能组成 batch。
@@ -71,9 +61,7 @@ sequenceDiagram
 - `start` 在取 batch 前记录；
 - `fetch` 在模型 forward 前记录；
 - `fwd`、`bwd`、`opt` 分别记录计算阶段；
-- `fetch_ms` 是从取 batch 到进入 forward 前的总等待，包含 DataLoader
-  取数、HTTP、Producer 处理、metadata 等待和 TE 读取，不能单独代表网络
-  传输时间。
+- `fetch_ms` 是从取 batch 到进入 forward 前的总等待，包含 DataLoader 取数、HTTP、Producer 处理、metadata 等待和 TE 读取，不能单独代表网络 传输时间。
 
 ### 当前拓扑
 
@@ -109,8 +97,7 @@ src/speculators/cli/generate_offline_data.py
   -> 离线生成 hidden states 文件
 ```
 
-这条路径用于离线数据生成，已经具有并发 worker 和请求 semaphore。但正式
-训练使用的是：
+这条路径用于离线数据生成，已经具有并发 worker 和请求 semaphore。但正式 训练使用的是：
 
 ```text
 src/speculators/train/data.py
@@ -130,8 +117,7 @@ src/speculators/train/data.py
 
 ## Mooncake TE ownership
 
-运行时 `hs_connectors/src/hs_connectors/mooncake_te_store.py` 的 metadata
-包含：
+运行时 `hs_connectors/src/hs_connectors/mooncake_te_store.py` 的 metadata 包含：
 
 ```json
 {
@@ -141,8 +127,7 @@ src/speculators/train/data.py
 }
 ```
 
-Consumer 使用 metadata 中的 `producer_ip:rpc_port` 建立 TE 读取目标。当前
-metadata 文件名由 request key 派生，并位于单一 `TE_META_DIR` 中。
+Consumer 使用 metadata 中的 `producer_ip:rpc_port` 建立 TE 读取目标。当前 metadata 文件名由 request key 派生，并位于单一 `TE_META_DIR` 中。
 
 这对单 Producer 是成立的。多 Producer 时必须保证：
 
@@ -165,8 +150,7 @@ metadata 文件名由 request key 派生，并位于单一 `TE_META_DIR` 中。
 }
 ```
 
-Router 只能路由 HTTP 请求，不能代理 hidden-state payload。大约 500 MB 的
-hidden states 必须继续由 Producer 通过 Mooncake TE 直接传给 Consumer。
+Router 只能路由 HTTP 请求，不能代理 hidden-state payload。大约 500 MB 的 hidden states 必须继续由 Producer 通过 Mooncake TE 直接传给 Consumer。
 
 ## 当前瓶颈如何判断
 
@@ -207,9 +191,7 @@ flowchart LR
     F --> G[batch ready]
 ```
 
-Producer 的 NPU 利用率也不能单独作为判断标准。当前历史实验已经说明，
-Producer 可能在 ACK/TE 同步等待时利用率不高，但仍然限制 Trainer；反过来，
-提高 Producer 并发也可能使 `copy_to_send_buffer` 的临时显存申请 OOM。
+Producer 的 NPU 利用率也不能单独作为判断标准。当前历史实验已经说明， Producer 可能在 ACK/TE 同步等待时利用率不高，但仍然限制 Trainer；反过来， 提高 Producer 并发也可能使 `copy_to_send_buffer` 的临时显存申请 OOM。
 
 ## 第一阶段：先改当前训练路径
 
@@ -217,8 +199,7 @@ Producer 可能在 ACK/TE 同步等待时利用率不高，但仍然限制 Train
 
 ### 目标
 
-在当前拓扑中验证：把下一批样本的 hidden-state 请求提前发出，是否能覆盖
-当前 Trainer 的 forward/backward 时间。
+在当前拓扑中验证：把下一批样本的 hidden-state 请求提前发出，是否能覆盖 当前 Trainer 的 forward/backward 时间。
 
 ```mermaid
 flowchart TD
@@ -275,8 +256,7 @@ src/speculators/train/config/schema.py
 
 ## 第二阶段：多节点 Trainer
 
-如果第一阶段证明训练计算仍占主要时间，或者预取后 Producer 能持续供给，
-再扩展 Trainer。
+如果第一阶段证明训练计算仍占主要时间，或者预取后 Producer 能持续供给， 再扩展 Trainer。
 
 ```mermaid
 flowchart LR
@@ -306,16 +286,13 @@ NPROC_PER_NODE
 - FSDP collective time；
 - effective steps/hour。
 
-只看到 forward/backward 变快，不代表总体训练变快。如果所有 rank 在一个
-Producer 前排队，扩展 Trainer 只会把瓶颈转移到 Producer。
+只看到 forward/backward 变快，不代表总体训练变快。如果所有 rank 在一个 Producer 前排队，扩展 Trainer 只会把瓶颈转移到 Producer。
 
-另外，当前 checkpoint 能否在不同 FSDP world size 间恢复，必须使用实际
-Ascend checkpoint 做验证，不能仅凭模型文件存在就认为可迁移。
+另外，当前 checkpoint 能否在不同 FSDP world size 间恢复，必须使用实际 Ascend checkpoint 做验证，不能仅凭模型文件存在就认为可迁移。
 
 ## 第三阶段：多 Producer
 
-只有当单 Producer 在 bounded prefetch 和多 Trainer 压测下被证明饱和时，才
-增加 Producer pool。
+只有当单 Producer 在 bounded prefetch 和多 Trainer 压测下被证明饱和时，才 增加 Producer pool。
 
 ```mermaid
 flowchart TD
@@ -342,8 +319,7 @@ Producer pool 需要：
 - timeout、retry 和 drain 状态；
 - 统一 image ID、代码版本、模型和 TE 协议。
 
-不建议第一版引入重型服务编排。可以先在训练进程中实现一个小型
-`ProducerPool`，但必须保持 Router 不承载 hidden-state 大 payload。
+不建议第一版引入重型服务编排。可以先在训练进程中实现一个小型 `ProducerPool`，但必须保持 Router 不承载 hidden-state 大 payload。
 
 ## 夜间扩容、早上缩容
 
@@ -362,8 +338,7 @@ flowchart TD
     I --> J[从同一 run directory resume]
 ```
 
-夜间 profile 和早间 profile 应是同一套代码的不同参数，而不是两套训练
-实现。handoff 至少记录：
+夜间 profile 和早间 profile 应是同一套代码的不同参数，而不是两套训练 实现。handoff 至少记录：
 
 - `global_step`；
 - FSDP world size；
@@ -372,35 +347,25 @@ flowchart TD
 - image ID 和代码 revision；
 - Producer topology 和 TE metadata namespace。
 
-早上缩容前不能直接 kill 任意 step 的进程，否则可能留下未完成的 TE request、
-脏 metadata 或不完整 checkpoint。
+早上缩容前不能直接 kill 任意 step 的进程，否则可能留下未完成的 TE request、 脏 metadata 或不完整 checkpoint。
 
 ## 当前不应做的事情
 
 - 不要仅启动第二个 Producer，当前训练端没有 endpoint pool，不会自动使用它。
 - 不要把两个 Producer 写入同一个 metadata namespace。
-- 不要直接把 `MAX_NUM_SEQS` 从 1 改成 2 作为生产方案，8K 历史实验已有
-  `copy_to_send_buffer` OOM。
+- 不要直接把 `MAX_NUM_SEQS` 从 1 改成 2 作为生产方案，8K 历史实验已有 `copy_to_send_buffer` OOM。
 - 不要在没有 world-size resume 验证前直接把 FSDP Trainer 改成多节点。
 - 不要让 HTTP Router 代理 hidden-state payload。
 - 不要修改当前正式训练容器、Producer 或 checkpoint 目录进行架构试验。
 
 ## 与上游 Speculators PR 的关系
 
-- PR #811：<https://github.com/vllm-project/speculators/pull/811>
-  提供有界异步 fan-out、cursor、lease 和生命周期管理思路，但实现后端是
-  POSIX artifact，不是当前 Ascend Mooncake TE。
-- PR #605：<https://github.com/vllm-project/speculators/pull/605>
-  是 Mooncake hidden-state transfer prototype，并明确将异步写入、Trainer
-  prefetch 和 vLLM fleet fan-out 留作后续。
-- PR #710：<https://github.com/vllm-project/speculators/pull/710>
-  是多节点 TCP/RDMA Mooncake 方向，目前不能视为已验证依赖。
-- PR #972：<https://github.com/vllm-project/speculators/pull/972>
-  已合入多节点 Trainer 示例，说明 Trainer 扩展方向存在，但不是弹性热
-  扩缩方案。
+- PR #811：<https://github.com/vllm-project/speculators/pull/811> 提供有界异步 fan-out、cursor、lease 和生命周期管理思路，但实现后端是 POSIX artifact，不是当前 Ascend Mooncake TE。
+- PR #605：<https://github.com/vllm-project/speculators/pull/605> 是 Mooncake hidden-state transfer prototype，并明确将异步写入、Trainer prefetch 和 vLLM fleet fan-out 留作后续。
+- PR #710：<https://github.com/vllm-project/speculators/pull/710> 是多节点 TCP/RDMA Mooncake 方向，目前不能视为已验证依赖。
+- PR #972：<https://github.com/vllm-project/speculators/pull/972> 已合入多节点 Trainer 示例，说明 Trainer 扩展方向存在，但不是弹性热 扩缩方案。
 
-上游没有一个可以直接应用到当前仓库的完整
-`multi-Producer + multi-Trainer + Ascend Mooncake TE` PR。
+上游没有一个可以直接应用到当前仓库的完整 `multi-Producer + multi-Trainer + Ascend Mooncake TE` PR。
 
 ## 最小可行改造
 
