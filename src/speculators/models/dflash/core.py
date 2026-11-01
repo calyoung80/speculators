@@ -371,9 +371,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             block_size=self.block_size,
             sliding_window=sliding_window,
             sliding_window_non_causal=sliding_window_non_causal,
-            dtype=getattr(
-                self.config.transformer_layer_config, "dtype", None
-            )
+            dtype=getattr(self.config.transformer_layer_config, "dtype", None)
             or torch.bfloat16,
         )
 
@@ -490,9 +488,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             noise_embedding = layer(
                 hidden_states=noise_embedding,
                 target_hidden=fc_output,
-                attention_mask=sliding_window_attn_mask
-                if layer_idx in self.sliding_window_indices
-                else full_attn_mask,
+                attention_mask=(
+                    sliding_window_attn_mask
+                    if layer_idx in self.sliding_window_indices
+                    else full_attn_mask
+                ),
                 position_ids=position_ids,
                 use_cache=False,
                 position_embeddings=position_embeddings,

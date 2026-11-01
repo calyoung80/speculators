@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import socket
 import time
@@ -22,22 +21,9 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-
-def _log_timing(message: str, *args: object) -> None:
-    """Keep T0 timing visible when vLLM filters connector INFO logs."""
-    if os.environ.get("TE_TIMING_LOG", "0") == "1":
-        logger.warning(message, *args)
-    else:
-        logger.info(message, *args)
-
 MAX_TOKEN_NUMEL = 512 * 1024  # 512K elements * 8 bytes = 4MB
-MAX_HS_NUMEL = (
-    32 * 1024 * 4 * 2048
-)  # 32K tokens * 4 layers * 2048 hidden = 256M elements * 2 bytes = 512MB
-TE_COPY_TOKEN_CHUNK_SIZE = max(
-    1, int(os.environ.get("TE_COPY_TOKEN_CHUNK_SIZE", "128"))
-)
-TE_META_DIR = os.environ.get("TE_META_DIR", "/tmp/te_meta")
+MAX_HS_NUMEL = 32 * 1024 * 4 * 2048  # 32K tokens * 4 layers * 2048 hidden = 256M elements * 2 bytes = 512MB
+TE_META_DIR = "/tmp/te_meta"
 
 # Global TE engine — shared between distributed.py pre-init and MooncakeTEStore
 _global_te_engine = None
@@ -55,16 +41,13 @@ def pre_init_te_engine():
         return _global_te_engine
 
     import torch_npu  # noqa: F401
-
     if torch.npu.is_available():
         torch.npu.set_device(torch.npu.current_device())
 
     hostname = socket.gethostbyname(socket.gethostname())
     from mooncake.engine import TransferEngine
-
     engine = TransferEngine()
-    protocol = os.environ.get("MOONCAKE_TE_PROTOCOL", "tcp")
-    ret = engine.initialize(hostname, "P2PHANDSHAKE", protocol, "")
+    ret = engine.initialize(hostname, "P2PHANDSHAKE", "ascend", "")
     if ret != 0:
         raise RuntimeError(f"pre_init_te_engine: initialize failed: ret={ret}")
     _global_te_engine = engine
@@ -75,7 +58,7 @@ def pre_init_te_engine():
 @dataclass
 class MooncakeTEConfig:
     local_hostname: str = ""
-    protocol: str = os.environ.get("MOONCAKE_TE_PROTOCOL", "tcp")
+    protocol: str = "ascend"
     device_name: str = ""
     zmq_port: int = 9999
     producer_ip: str = ""
@@ -93,8 +76,8 @@ class MooncakeTEConfig:
 class MooncakeTEStore:
     """TransferEngine store — register once, transfer with offsets.
 
-    Producer (vLLM): gathers hidden states into a persistent registered buffer;
-    token_ids are inlined in metadata.
+    Producer (vLLM): registers KV cache in register_kv_cache();
+    token_ids copied into a small pre-registered buffer.
     Consumer (training): pre-allocates + registers receive buffers.
     Metadata exchanged via files (no ZMQ, no deadlock).
     """
@@ -112,8 +95,6 @@ class MooncakeTEStore:
         self._send_hs_buffer = None
         self._send_hs_ptr = 0
         self._send_offset = 0
-        self._generation_by_key: dict[str, int] = {}
-        self._producer_epoch = f"{time.time_ns():x}-{os.getpid():x}"
 
     @property
     def is_setup(self) -> bool:
@@ -142,21 +123,15 @@ class MooncakeTEStore:
             logger.info("Reusing pre-initialized TE engine")
         else:
             from mooncake.engine import TransferEngine  # noqa: PLC0415
-
             engine = TransferEngine()
             ret = engine.initialize(
-                self._local_hostname,
-                "P2PHANDSHAKE",
-                self.config.protocol,
-                self.config.device_name,
+                self._local_hostname, "P2PHANDSHAKE", self.config.protocol, self.config.device_name
             )
             if ret != 0:
                 raise RuntimeError(f"TransferEngine.initialize failed: ret={ret}")
         self._engine = engine
 
-        self._token_buffer = torch.empty(
-            MAX_TOKEN_NUMEL, dtype=torch.long, pin_memory=True
-        )
+        self._token_buffer = torch.empty(MAX_TOKEN_NUMEL, dtype=torch.long, pin_memory=True)
         self._token_buffer_ptr = self._token_buffer.data_ptr()
         ret = engine.register_memory(self._token_buffer_ptr, self._token_buffer.nbytes)
         if ret != 0:
@@ -178,8 +153,7 @@ class MooncakeTEStore:
             device = f"npu:{torch.npu.current_device()}"
             self._recv_hs_buffer = torch.empty(
                 MAX_HS_NUMEL,
-                dtype=torch.bfloat16,
-                device=device,
+                dtype=torch.bfloat16, device=device,
             )
             self._recv_hs_ptr = self._recv_hs_buffer.data_ptr()
             ret = engine.register_memory(self._recv_hs_ptr, self._recv_hs_buffer.nbytes)
@@ -187,25 +161,13 @@ class MooncakeTEStore:
                 raise RuntimeError(f"register_memory failed for recv_hs: ret={ret}")
 
         os.makedirs(TE_META_DIR, exist_ok=True)
-        if self._is_producer:
-            self._cleanup_stale_samples()
 
-        logger.info(
-            "TE buffers registered (token=%d elems @0x%x)",
-            self._token_buffer.numel(),
-            self._token_buffer_ptr,
-        )
+        logger.info("TE buffers registered (token=%d elems @0x%x)",
+                     self._token_buffer.numel(), self._token_buffer_ptr)
         if self._is_producer and self._send_hs_buffer is not None:
-            logger.info(
-                "TE send_hs buffer: %d elems @0x%x",
-                self._send_hs_buffer.numel(),
-                self._send_hs_ptr,
-            )
-        logger.info(
-            "TE store setup complete (producer=%s, hostname=%s)",
-            self._is_producer,
-            self._local_hostname,
-        )
+            logger.info("TE send_hs buffer: %d elems @0x%x", self._send_hs_buffer.numel(), self._send_hs_ptr)
+        logger.info("TE store setup complete (producer=%s, hostname=%s)",
+                     self._is_producer, self._local_hostname)
 
         self._is_setup = True
         return self
@@ -216,7 +178,6 @@ class MooncakeTEStore:
             del self._engine
             self._engine = None
             import gc
-
             gc.collect()
             logger.info("TE engine closed (ADXL destroyed)")
 
@@ -224,13 +185,10 @@ class MooncakeTEStore:
         """Re-create engine if it was closed."""
         if self._engine is None:
             from mooncake.engine import TransferEngine
-
             engine = TransferEngine()
             ret = engine.initialize(
-                self._local_hostname,
-                "P2PHANDSHAKE",
-                self.config.protocol,
-                self.config.device_name,
+                self._local_hostname, "P2PHANDSHAKE",
+                self.config.protocol, self.config.device_name
             )
             if ret != 0:
                 raise RuntimeError(f"TransferEngine re-init failed: ret={ret}")
@@ -253,13 +211,6 @@ class MooncakeTEStore:
     def reset_send_buffer(self) -> None:
         self._send_offset = 0
 
-    def has_send_capacity(self, kv_cache: torch.Tensor, num_tokens: int) -> bool:
-        """Check whether another lease fits without overwriting live data."""
-        if self._send_hs_buffer is None:
-            return True
-        required_numel = num_tokens * math.prod(kv_cache.shape[2:])
-        return self._send_offset + required_numel <= self._send_hs_buffer.numel()
-
     def copy_to_send_buffer(
         self, kv_cache: torch.Tensor, slot_mapping: torch.Tensor, num_tokens: int
     ) -> tuple[int, int, list[int]]:
@@ -267,73 +218,37 @@ class MooncakeTEStore:
         # AFTER setup() and ADXL engine init (avoids HcclCommPrepare conflict).
         if self._send_hs_buffer is None:
             import torch_npu  # noqa: F401
-
             device = f"npu:{torch.npu.current_device()}"
             self._send_hs_buffer = torch.empty(
-                MAX_HS_NUMEL,
-                dtype=torch.bfloat16,
-                device=device,
+                MAX_HS_NUMEL, dtype=torch.bfloat16, device=device,
             )
             self._send_hs_ptr = self._send_hs_buffer.data_ptr()
-            ret = self._engine.register_memory(
-                self._send_hs_ptr, self._send_hs_buffer.nbytes
-            )
+            ret = self._engine.register_memory(self._send_hs_ptr, self._send_hs_buffer.nbytes)
             if ret != 0:
-                raise RuntimeError(
-                    f"register_memory failed for send_hs (lazy): ret={ret}"
-                )
-            logger.info(
-                "TE send_hs buffer lazily allocated: %d elems @0x%x",
-                self._send_hs_buffer.numel(),
-                self._send_hs_ptr,
-            )
+                raise RuntimeError(f"register_memory failed for send_hs (lazy): ret={ret}")
+            logger.info("TE send_hs buffer lazily allocated: %d elems @0x%x",
+                        self._send_hs_buffer.numel(), self._send_hs_ptr)
 
         block_size = kv_cache.shape[1]
-        slot_mapping = slot_mapping.reshape(-1)[:num_tokens]
-        per_token_numel = math.prod(kv_cache.shape[2:])
-        numel = slot_mapping.numel() * per_token_numel
+        extracted = kv_cache[slot_mapping // block_size, slot_mapping % block_size][:num_tokens]
+        extracted = extracted.contiguous()
+        numel = extracted.numel()
         if self._send_offset + numel > self._send_hs_buffer.numel():
             raise RuntimeError(
                 f"send_hs_buffer overflow: need {self._send_offset + numel}, "
                 f"have {self._send_hs_buffer.numel()}"
             )
-
-        # Advanced indexing of the complete request materializes a temporary
-        # tensor proportional to the whole prompt. With Qwen3.8-27B and a
-        # 5K-token request that temporary was ~2.4 GiB and killed the Producer.
-        # Gather bounded token chunks and write them directly into the already
-        # registered send buffer instead.
-        chunk_tokens = TE_COPY_TOKEN_CHUNK_SIZE
-        copy_start = time.perf_counter()
-        write_offset = self._send_offset
-        for start in range(0, slot_mapping.numel(), chunk_tokens):
-            stop = min(start + chunk_tokens, slot_mapping.numel())
-            chunk_slots = slot_mapping[start:stop]
-            extracted = kv_cache[
-                chunk_slots // block_size, chunk_slots % block_size
-            ].contiguous()
-            chunk_numel = extracted.numel()
-            self._send_hs_buffer[write_offset : write_offset + chunk_numel].copy_(
-                extracted.view(-1)
-            )
-            write_offset += chunk_numel
-            del extracted
+        self._send_hs_buffer[self._send_offset:self._send_offset + numel].copy_(
+            extracted.view(-1)
+        )
         torch.npu.current_stream().synchronize()
-        element_size = kv_cache.element_size()
-        copy_ms = (time.perf_counter() - copy_start) * 1000
-        ptr = self._send_hs_ptr + self._send_offset * element_size
-        size = numel * element_size
-        shape = [slot_mapping.numel(), *kv_cache.shape[2:]]
+        ptr = self._send_hs_ptr + self._send_offset * extracted.element_size()
+        size = numel * extracted.element_size()
+        shape = list(extracted.shape)
         self._send_offset += numel
-        _log_timing(
-            "copy_to_send_buffer: %d tokens, %d bytes, offset=%d, ptr=0x%x, "
-            "chunk_tokens=%d, copy_ms=%.2f",
-            num_tokens,
-            size,
-            self._send_offset - numel,
-            ptr,
-            chunk_tokens,
-            copy_ms,
+        logger.info(
+            "copy_to_send_buffer: %d tokens, %d bytes, offset=%d, ptr=0x%x",
+            num_tokens, size, self._send_offset - numel, ptr,
         )
         return ptr, size, shape
 
@@ -341,54 +256,7 @@ class MooncakeTEStore:
         safe_key = key.replace("/", "_").replace("\\", "_")
         return os.path.join(TE_META_DIR, f"{safe_key}.json")
 
-    def _ack_path(self, key: str) -> str:
-        safe_key = key.replace("/", "_").replace("\\", "_")
-        return os.path.join(TE_META_DIR, f"{safe_key}.ack")
-
-    @staticmethod
-    def _write_json_atomically(path: str, payload: dict) -> None:
-        tmp_path = f"{path}.tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(payload, f)
-        os.replace(tmp_path, path)
-
-    @staticmethod
-    def _read_json(path: str) -> dict:
-        with open(path) as f:
-            return json.load(f)
-
-    def _cleanup_stale_samples(self) -> None:
-        """Remove abandoned files only when an operator explicitly enables TTL."""
-        ttl = float(os.environ.get("TE_ACK_STALE_TTL", "0"))
-        if ttl <= 0:
-            return
-        cutoff = time.time() - ttl
-        for entry in os.scandir(TE_META_DIR):
-            if not entry.name.endswith(".json"):
-                continue
-            ack_path = f"{entry.path[:-5]}.ack"
-            try:
-                if (
-                    os.path.exists(ack_path)
-                    and max(entry.stat().st_mtime, os.stat(ack_path).st_mtime) < cutoff
-                ):
-                    os.remove(entry.path)
-                    os.remove(ack_path)
-                    logger.warning("Removed stale TE lease: %s", entry.path[:-5])
-            except FileNotFoundError:
-                pass
-        for entry in os.scandir(TE_META_DIR):
-            if not entry.name.endswith(".ack"):
-                continue
-            metadata_path = f"{entry.path[:-4]}.json"
-            try:
-                if not os.path.exists(metadata_path) and entry.stat().st_mtime < cutoff:
-                    os.remove(entry.path)
-                    logger.warning("Removed stale orphan TE ACK: %s", entry.path)
-            except FileNotFoundError:
-                pass
-
-    def put_sample(self, key: str, tensor_specs: dict[str, dict]) -> str:
+    def put_sample(self, key: str, tensor_specs: dict[str, dict]) -> None:
         """Write TE metadata to file. Consumer polls and reads it.
 
         No ZMQ, no blocking, no deadlock.
@@ -398,37 +266,24 @@ class MooncakeTEStore:
         if not self._is_setup:
             raise RuntimeError("call setup() first")
 
-        publish_start = time.perf_counter()
-        generation_index = self._generation_by_key.get(key, 0) + 1
-        self._generation_by_key[key] = generation_index
-        generation = f"{self._producer_epoch}-{generation_index}"
         metadata = {
-            "version": 1,
-            "request_key": key,
-            "generation": generation,
             "producer_ip": self._local_hostname,
             "rpc_port": self._engine.get_rpc_port(),
             "tensors": tensor_specs,
         }
 
         path = self._meta_path(key)
-        self._write_json_atomically(path, metadata)
-        _log_timing(
-            "put_sample key=%s generation=%s, metadata written to %s, publish_ms=%.2f",
-            key,
-            generation,
-            path,
-            (time.perf_counter() - publish_start) * 1000,
-        )
-        return generation
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(metadata, f)
+        os.rename(tmp_path, path)
+        logger.info("put_sample key=%s, metadata written to %s", key, path)
 
     def copy_token_ids(self, token_ids: torch.Tensor) -> tuple[int, int]:
         t = token_ids.detach().contiguous().view(-1).to(torch.long).cpu()
         if t.numel() > self._token_buffer.numel():
-            raise RuntimeError(
-                f"token_ids too large: {t.numel()} > {self._token_buffer.numel()}"
-            )
-        self._token_buffer[: t.numel()].copy_(t)
+            raise RuntimeError(f"token_ids too large: {t.numel()} > {self._token_buffer.numel()}")
+        self._token_buffer[:t.numel()].copy_(t)
         return self._token_buffer_ptr, t.nbytes
 
     def get_sample(
@@ -450,19 +305,8 @@ class MooncakeTEStore:
                 raise RuntimeError(f"Timeout waiting for metadata file: {path}")
             time.sleep(poll_interval)
 
-        metadata_wait = time.perf_counter() - t0
-        logger.info(
-            "get_sample_metadata key=%s wait_ms=%.2f",
-            key,
-            metadata_wait * 1000,
-        )
-
-        metadata = self._read_json(path)
-        if metadata.get("version") != 1 or metadata.get("request_key") != key:
-            raise RuntimeError(f"Invalid TE metadata for key={key}")
-        generation = metadata.get("generation")
-        if not isinstance(generation, str) or not generation:
-            raise RuntimeError(f"Invalid TE metadata generation for key={key}")
+        with open(path) as f:
+            metadata = json.load(f)
 
         session_id = f"{metadata['producer_ip']}:{metadata['rpc_port']}"
 
@@ -533,14 +377,8 @@ class MooncakeTEStore:
 
                 total_bytes = sum(length_list)
                 throughput = total_bytes / elapsed / 1024 / 1024 if elapsed > 0 else 0
-                logger.info(
-                    "get_sample key=%s, ret=%d, %.2fms, %.1f MB/s, %d bytes",
-                    key,
-                    ret,
-                    elapsed * 1000,
-                    throughput,
-                    total_bytes,
-                )
+                logger.info("get_sample key=%s, ret=%d, %.2fms, %.1f MB/s, %d bytes",
+                             key, ret, elapsed * 1000, throughput, total_bytes)
 
             if ret < 0:
                 raise RuntimeError(f"batch_transfer_sync_read failed: ret={ret}")
@@ -560,65 +398,24 @@ class MooncakeTEStore:
                     tensor = self._token_buffer[:expected_numel].view(shape).clone()
                 result[name] = tensor
 
-        # Publish a durable, versioned ACK only after transfer and cloning finish.
-        # Producer owns ACK consumption and source-buffer release.
-        self._write_json_atomically(
-            self._ack_path(key),
-            {
-                "version": 1,
-                "request_key": key,
-                "generation": generation,
-                "consumer_id": f"{self._local_hostname}:{os.getpid()}",
-            },
-        )
+        # ACK sync: write ACK file to signal producer that data has been read.
+        ack_path = f"/tmp/te_meta/{key}.ack"
+        with open(ack_path, "w") as f:
+            f.write("ok")
 
         return result
 
-    def wait_for_ack(self, key: str, generation: str, timeout: float) -> float:
-        """Wait for and validate the Consumer ACK for one published generation."""
-        ack_path = self._ack_path(key)
-        started = time.perf_counter()
-        while not os.path.exists(ack_path):
-            if time.perf_counter() - started > timeout:
-                raise TimeoutError(
-                    f"ACK timeout for key={key} generation={generation} after {timeout}s"
-                )
-            time.sleep(0.01)
-
-        ack = self._read_json(ack_path)
-        if (
-            ack.get("version") != 1
-            or ack.get("request_key") != key
-            or ack.get("generation") != generation
-        ):
-            raise RuntimeError(
-                f"ACK does not match key={key} generation={generation}: {ack}"
-            )
-        return time.perf_counter() - started
-
-    def release_sample(self, key: str, generation: str) -> None:
-        """Consume a matching ACK and release Producer-owned control-plane state."""
-        metadata_path = self._meta_path(key)
-        metadata = self._read_json(metadata_path)
-        if (
-            metadata.get("version") != 1
-            or metadata.get("request_key") != key
-            or metadata.get("generation") != generation
-        ):
-            raise RuntimeError(
-                f"Metadata does not match key={key} generation={generation}: {metadata}"
-            )
-        ack_path = self._ack_path(key)
-        ack = self._read_json(ack_path)
-        if ack.get("request_key") != key or ack.get("generation") != generation:
-            raise RuntimeError(
-                f"ACK does not match key={key} generation={generation}: {ack}"
-            )
-        os.remove(metadata_path)
-        os.remove(ack_path)
-
     def delete_sample(self, key: str) -> None:
-        """Consumer-side lifecycle hook; Producer owns metadata and ACK removal."""
+        path = self._meta_path(key)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        ack_path = f"/tmp/te_meta/{key}.ack"
+        try:
+            os.remove(ack_path)
+        except FileNotFoundError:
+            pass
 
     def close(self) -> None:
         pass

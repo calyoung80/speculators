@@ -2,7 +2,6 @@ import fcntl
 import logging
 import os
 import threading
-import time
 import warnings
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
@@ -33,26 +32,10 @@ from speculators.train.recovery import (
 
 BatchType = dict[str, Any]
 logger = logging.getLogger("speculators")
-_ONLINE_GENERATION_LOCK = Path("/tmp/speculators-online-hidden-state-generation.lock")
 
-# The upstream fcntl lock serializes ALL in-flight online hidden-state
-# generation requests across ranks and dataloader workers (only one request
-# flying at any time). On single-producer pipelines that already queue
-# server-side this wastes the whole fetch window - measured ~26s of a 27.4s
-# step. Setting SPECULATORS_ONLINE_GENERATION_CONCURRENCY>0 replaces the
-# exclusive lock with a bounded semaphore (8 concurrent requests;
-# load-tested stable at 8). Default is 0 = upstream lock behavior, so shared
-# code trees stay conservative unless a launch script opts in explicitly.
-#
-# SPECULATORS_ONLINE_GENERATION_LOCK=1 is a hard override that forces the
-# upstream lock even when a concurrency value is set (compatibility with the
-# original m40 patch, where this env was the revert switch).
-_ONLINE_GENERATION_CONCURRENCY = int(
-    os.environ.get("SPECULATORS_ONLINE_GENERATION_CONCURRENCY", "0")
-)
-_ONLINE_GENERATION_LOCK_FORCED = (
-    os.environ.get("SPECULATORS_ONLINE_GENERATION_LOCK", "0") == "1"
-)
+_ONLINE_GENERATION_LOCK = Path("/tmp/speculators-online-hidden-state-generation.lock")
+_ONLINE_GENERATION_CONCURRENCY = int(os.environ.get("SPECULATORS_ONLINE_GENERATION_CONCURRENCY", "0"))
+_ONLINE_GENERATION_LOCK_FORCED = os.environ.get("SPECULATORS_ONLINE_GENERATION_LOCK", "0") == "1"
 _generation_semaphore = (
     threading.Semaphore(_ONLINE_GENERATION_CONCURRENCY)
     if _ONLINE_GENERATION_CONCURRENCY > 0 and not _ONLINE_GENERATION_LOCK_FORCED
@@ -75,6 +58,7 @@ def _online_generation_lock():
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
 
 
 def create_empty_sample(
@@ -290,11 +274,9 @@ class ArrowDataset(BaseDataset):
         client_item: ClientItem,
     ) -> dict[str, torch.Tensor]:
         handle: str | None = None
-        round_trip_start = time.perf_counter()
         try:
             if not self.client:
                 self._setup_client()
-            http_start = time.perf_counter()
             handle = generate_hidden_states(
                 self.client,  # type:ignore[arg-type]
                 self.model,  # type:ignore[arg-type]
@@ -302,11 +284,8 @@ class ArrowDataset(BaseDataset):
                 timeout=self.request_timeout,
                 max_retries=self.max_retries,
             )
-            http_ms = (time.perf_counter() - http_start) * 1000
 
-            transfer_start = time.perf_counter()
             loaded_hs = self.transfer.get_generated(handle)
-            transfer_ms = (time.perf_counter() - transfer_start) * 1000
             if loaded_hs is None:
                 raise ValueError(f"Failed to load hidden states for handle {handle}")
 
@@ -314,12 +293,9 @@ class ArrowDataset(BaseDataset):
             # transfer performs manifest/checksum validation first.
             _ids = dataset_item["input_ids"]
             _ids = _ids if isinstance(_ids, list) else _ids.tolist()
-            validation_start = time.perf_counter()
             check_hidden_states(loaded_hs, _ids)
-            validation_ms = (time.perf_counter() - validation_start) * 1000
 
             file_idx = self._map_to_file_idx(index)
-            cleanup_start = time.perf_counter()
             if self.on_generate == "cache":
                 self.transfer.cache(handle, file_idx)
             else:
@@ -332,19 +308,6 @@ class ArrowDataset(BaseDataset):
                         handle,
                         cleanup_error,
                     )
-            cleanup_ms = (time.perf_counter() - cleanup_start) * 1000
-            logger.info(
-                "hidden_state_stages index=%d handle=%s http_ms=%.2f "
-                "transfer_ms=%.2f validation_ms=%.2f cleanup_ms=%.2f "
-                "round_trip_ms=%.2f",
-                index,
-                handle,
-                http_ms,
-                transfer_ms,
-                validation_ms,
-                cleanup_ms,
-                (time.perf_counter() - round_trip_start) * 1000,
-            )
             return loaded_hs
         except Exception:
             if handle is not None:

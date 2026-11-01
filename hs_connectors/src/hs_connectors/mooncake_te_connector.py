@@ -68,7 +68,7 @@ class ReqMeta:
     token_ids: torch.Tensor
 
     @staticmethod
-    def make_meta(req_id: str, token_ids: list[int]) -> ReqMeta:
+    def make_meta(req_id: str, token_ids: list[int]) -> "ReqMeta":
         return ReqMeta(req_id=req_id, token_ids=torch.tensor(token_ids))
 
 
@@ -157,9 +157,9 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._request_keys: dict[str, str] = {}
         self._pending_saves: dict[str, PendingSave] = {}
 
-        # Each publication owns a non-overlapping range of the registered send
-        # buffer until its Consumer ACK is observed.
-        self._pending_te_leases: list[tuple[str, str]] = []
+        # ACK sync: track previous request key to prevent KV cache block
+        # overwrite before consumer has read via TE transfer.
+        self._prev_te_key: str | None = None
 
         self._kv_cache: torch.Tensor | None = None
         self._is_tp_rank_zero: bool = True
@@ -183,48 +183,40 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     # ==============================
 
     def start_load_kv(self, *args: Any, **kwargs: Any) -> None:
-        if not self._store_ready:
-            return
-        self._release_acked_leases()
-        if not self._pending_te_leases and self._store._send_hs_buffer is not None:
+        if self._store_ready and self._store._send_hs_buffer is not None:
             self._store.reset_send_buffer()
 
-    def _release_acked_leases(self) -> None:
-        remaining = []
-        for key, generation in self._pending_te_leases:
+        # ACK sync: wait for previous request's ACK before this request's
+        # unified_kv_cache_update overwrites KV cache blocks.
+        prev_key = self._prev_te_key
+        if prev_key is not None and self._store_ready:
             try:
-                self._store.wait_for_ack(key, generation, timeout=0.0)
-                self._store.release_sample(key, generation)
-                logger.warning(
-                    "ack_release key=%s generation=%s pending=%d",
-                    key,
-                    generation,
-                    len(self._pending_te_leases) - 1,
-                )
-            except TimeoutError:
-                remaining.append((key, generation))
-            except (OSError, RuntimeError) as exc:
-                logger.error(
-                    "TE lease remains pending key=%s generation=%s: %s",
-                    key,
-                    generation,
-                    exc,
-                )
-                remaining.append((key, generation))
-        self._pending_te_leases = remaining
-
-    def _wait_for_send_capacity(self, num_tokens: int) -> None:
-        if self._store.has_send_capacity(self._kv_cache, num_tokens):
-            return
-        wait_started = time.perf_counter()
-        while self._pending_te_leases:
-            self._release_acked_leases()
-            if self._pending_te_leases:
-                time.sleep(0.01)
-        self._store.reset_send_buffer()
-        logger.warning(
-            "send_buffer_reset wait_ms=%.2f", (time.perf_counter() - wait_started) * 1000
-        )
+                meta = self._get_connector_metadata()
+                has_new = hasattr(meta, "requests") and meta.requests
+            except Exception:
+                has_new = False
+            if has_new:
+                prev_meta = f"/tmp/te_meta/{prev_key}.json"
+                if not os.path.exists(prev_meta):
+                    self._prev_te_key = None
+                else:
+                    ack_path = f"/tmp/te_meta/{prev_key}.ack"
+                    t0 = time.perf_counter()
+                    ack_timeout = float(os.environ.get("TE_ACK_TIMEOUT", "5"))
+                    while not os.path.exists(ack_path):
+                        if time.perf_counter() - t0 > ack_timeout:
+                            logger.warning(
+                                "ACK timeout for prev_key=%s after %.1fs",
+                                prev_key, ack_timeout,
+                            )
+                            break
+                        time.sleep(0.01)
+                    else:
+                        try:
+                            os.remove(ack_path)
+                        except OSError:
+                            pass
+                    self._prev_te_key = None
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
@@ -249,10 +241,7 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(attn_metadata, CacheOnlyAttentionMetadata)
 
         connector_metadata = self._get_connector_metadata()
-        if (
-            not hasattr(connector_metadata, "requests")
-            or not connector_metadata.requests
-        ):
+        if not hasattr(connector_metadata, "requests") or not connector_metadata.requests:
             return
 
         slot_mapping = get_forward_context().slot_mapping[layer_name]
@@ -302,43 +291,52 @@ class MooncakeTEHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_cache = kv_caches[cache_layers[0]]
         self._cache_layers = cache_layers
 
+        # Register KV cache with TransferEngine (vllm-ascend pattern:
+        # register once in register_kv_caches, use base_addr+offset for transfer)
+        if self._store.is_setup:
+            self._store.register_kv_cache(self._kv_cache)
+
     def _ensure_store(self) -> None:
         if not self._store_ready:
             self._store.setup()
             self._store_ready = True
+            # If kv_cache already available (register_kv_caches called before setup),
+            # register it now
+            if self._kv_cache is not None:
+                self._store.register_kv_cache(self._kv_cache)
 
     def _write_sample(self, pending: PendingSave) -> None:
         num_tokens = len(pending.token_ids)
-        self._wait_for_send_capacity(num_tokens)
-        ptr, size, shape = self._store.copy_to_send_buffer(
-            self._kv_cache, pending.slot_mapping, num_tokens
-        )
+
+        # Block-based approach: write KV cache block addresses directly
+        block_size = self._kv_cache.shape[1]
+        slots = pending.slot_mapping
+        block_ids = (slots // block_size).unique().tolist()
+
+        blocks = []
+        per_token_bytes = self._kv_cache.element_size() * self._kv_cache.shape[2:].numel()
+        for bid in block_ids:
+            block_base = self._kv_cache.data_ptr() + bid * block_size * per_token_bytes
+            block_bytes = block_size * per_token_bytes
+            blocks.append({"ptr": block_base, "size": block_bytes})
 
         tensor_specs = {
             "hidden_states": {
-                "ptr": ptr,
-                "size": size,
-                "shape": shape,
+                "blocks": blocks,
+                "per_token_bytes": per_token_bytes,
+                "shape": [num_tokens, self._kv_cache.shape[2], self._kv_cache.shape[3]],
                 "dtype": str(self._kv_cache.dtype),
             },
         }
 
-        tid_list = (
-            pending.token_ids.detach()
-            .contiguous()
-            .view(-1)
-            .to(torch.long)
-            .cpu()
-            .tolist()
-        )
+        tid_list = pending.token_ids.detach().contiguous().view(-1).to(torch.long).cpu().tolist()
         tensor_specs["token_ids"] = {
             "data": tid_list,
-            "shape": list(pending.token_ids.shape),
-            "dtype": str(pending.token_ids.dtype),
+            "shape": list(pending.token_ids.shape), "dtype": str(pending.token_ids.dtype),
         }
 
-        generation = self._store.put_sample(pending.te_key, tensor_specs)
-        self._pending_te_leases.append((pending.te_key, generation))
+        self._store.put_sample(pending.te_key, tensor_specs)
+        self._prev_te_key = pending.te_key
 
     def get_finished(
         self, finished_req_ids: set[str]

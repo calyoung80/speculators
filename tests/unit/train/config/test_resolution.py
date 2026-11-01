@@ -1,7 +1,7 @@
 """Resolution seam tests plus the example-recipe back-compat suite.
 
 The recipe suite is the central backward-compatibility guard: each real
-``examples/train/*.sh`` recipe's ``train.py`` invocation is extracted (bash does
+``examples/train/*.sh`` recipe's training invocation is extracted (bash does
 the variable expansion and word-splitting, exactly as a user's shell would) and
 run through :meth:`TrainConfig.resolve`; the flags it sets must resolve to their
 expected values in the flat dict. A renamed, dropped, or retyped flag breaks a
@@ -327,6 +327,48 @@ def test_dflash2_exclusive_block_warns_for_other_dflash_family_member():
         )
 
 
+def test_on_generate_flag_warns_deprecated():
+    with pytest.warns(FutureWarning, match="--on-generate is deprecated"):
+        TrainConfig.from_sources(
+            cli={"verifier_name_or_path": "m", "on_generate": "delete"},
+            argv=["train.py"],
+        )
+
+
+def test_on_generate_yaml_warns_deprecated(tmp_path):
+    config_path = _write(tmp_path, "train:\n  generation:\n    on_generate: delete\n")
+    with pytest.warns(FutureWarning, match="--on-generate is deprecated"):
+        TrainConfig.from_sources(
+            cli={"verifier_name_or_path": "m"},
+            config_path=config_path,
+            argv=["train.py"],
+        )
+
+
+def test_peagle_flag_warns_deprecated():
+    with pytest.warns(FutureWarning, match="P-EAGLE is deprecated"):
+        TrainConfig.from_sources(
+            cli={"verifier_name_or_path": "m", "speculator_type": "peagle"},
+            argv=["train.py"],
+        )
+
+
+def test_peagle_yaml_warns_deprecated(tmp_path):
+    config_path = _write(tmp_path, "train:\n  speculator_type: peagle\n")
+    with pytest.warns(FutureWarning, match="P-EAGLE is deprecated"):
+        TrainConfig.from_sources(
+            cli={"verifier_name_or_path": "m"},
+            config_path=config_path,
+            argv=["train.py"],
+        )
+
+
+def test_default_on_generate_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        TrainConfig.from_sources(cli={"verifier_name_or_path": "m"}, argv=["train.py"])
+
+
 def test_default_algorithm_block_does_not_warn():
     # An untouched (all-default) mismatched group is not "set", so it stays silent.
     with warnings.catch_warnings():
@@ -378,6 +420,8 @@ def test_resolve_dflash2_flags_and_derived_defaults():
             "12",
             "--selector-loss-alpha",
             "0.3",
+            "--selector-miss-policy",
+            "strict",
         ]
     )
     flat = cfg.flatten()
@@ -390,6 +434,7 @@ def test_resolve_dflash2_flags_and_derived_defaults():
     assert flat["selector_rank"] == 128
     assert flat["selector_top_k"] == 12
     assert flat["selector_loss_alpha"] == pytest.approx(0.3)
+    assert flat["selector_miss_policy"] == "strict"
 
 
 def test_resolve_dflash2_allows_explicit_causal_override():
@@ -472,6 +517,14 @@ def test_resolve_flag_overrides_config_file(tmp_path):
     assert cfg.flatten()["lr"] == 0.5
 
 
+def test_resolve_max_transfer_workers():
+    cfg = TrainConfig.resolve(
+        ["--verifier-name-or-path", "m", "--max-transfer-workers", "1"]
+    )
+
+    assert cfg.flatten()["max_transfer_workers"] == 1
+
+
 def test_help_is_grouped_by_concern():
     titles = {group.title for group in build_parser()._action_groups}
     assert {
@@ -514,7 +567,7 @@ def _train_invocation_args(lines: list[str]) -> str:
 
 
 def _recipe_argv(path: Path) -> list[str]:
-    """Extract the argv a recipe threads into ``train.py`` via a real shell."""
+    """Extract the argv a recipe threads into training via a real shell."""
     lines = path.read_text().splitlines()
     script = (
         "\n".join(_config_block(lines))
@@ -547,7 +600,6 @@ RECIPES: dict[str, dict] = {
         "num_layers": 5,
         "target_layer_ids": [2, 18, 33],
         "on_missing": "generate",
-        "on_generate": "delete",
     },
     "dflash_qwen3_8b_ultrachat_online_5k_bestpractices.sh": {
         "verifier_name_or_path": "Qwen/Qwen3-8B",
@@ -568,7 +620,6 @@ RECIPES: dict[str, dict] = {
         "loss_fn": "ce",
         "target_layer_ids": [2, 18, 33],
         "on_missing": "generate",
-        "on_generate": "delete",
     },
     "dflash2_qwen3_8b_ultrachat_online_5k.sh": {
         "verifier_name_or_path": "Qwen/Qwen3-8B",
@@ -584,7 +635,6 @@ RECIPES: dict[str, dict] = {
         "num_layers": 5,
         "target_layer_ids": [2, 18, 33],
         "on_missing": "generate",
-        "on_generate": "delete",
     },
     "dspark_qwen3_0_6b_sharegpt_online.sh": {
         "verifier_name_or_path": "Qwen/Qwen3-0.6B",
@@ -607,7 +657,6 @@ RECIPES: dict[str, dict] = {
         "loss_fn": '{"ce": 0.1, "tv": 0.9}',
         "confidence_head_alpha": 1.0,
         "on_missing": "generate",
-        "on_generate": "delete",
     },
     "eagle3_llama3_8b_ultrachat_offline_5k.sh": {
         "verifier_name_or_path": "meta-llama/Llama-3.1-8B-Instruct",
@@ -630,7 +679,6 @@ RECIPES: dict[str, dict] = {
         "lr": 1e-4,
         "total_seq_len": 8192,
         "on_missing": "generate",
-        "on_generate": "delete",
     },
     "mtp_qwen3_5_9b_gsm8k_online.sh": {
         "verifier_name_or_path": "Qwen/Qwen3.5-9B",
@@ -645,7 +693,6 @@ RECIPES: dict[str, dict] = {
         "lr": 1e-4,
         "total_seq_len": 8192,
         "on_missing": "generate",
-        "on_generate": "delete",
     },
     "peagle_qwen3_8b_ultrachat_online_5k.sh": {
         "verifier_name_or_path": "Qwen/Qwen3-8B",
@@ -666,7 +713,6 @@ RECIPES: dict[str, dict] = {
         "norm_before_residual": False,
         "scheduler_type": "cosine",
         "on_missing": "generate",
-        "on_generate": "delete",
     },
 }
 

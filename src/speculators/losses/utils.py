@@ -251,7 +251,7 @@ def compound_loss(
     reports a token count, the dict also carries ``__token_count__`` so the
     caller can report a true token-weighted ``loss_total`` metric.
     """
-    total = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+    total = torch.zeros((), device=logits.device, dtype=torch.float32)
     term_losses: dict[str, torch.Tensor] = {}
     token_counts: list[torch.Tensor] = []
     multi = len(loss_config) > 1
