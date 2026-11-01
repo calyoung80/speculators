@@ -1,6 +1,5 @@
 import warnings
 from collections.abc import Callable, Sequence
-from contextlib import contextmanager
 from os import PathLike
 from pathlib import Path
 from typing import Any, Literal

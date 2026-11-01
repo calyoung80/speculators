@@ -314,3 +314,8 @@ markers = [
     "slow: tests that take a long time to run",
     "multi_gpu: tests that require 2+ GPUs"
 ]
+
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+ignore_errors = true

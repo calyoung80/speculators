@@ -575,7 +575,7 @@ class Trainer:
 
             grad_accum = self.config.gradient_accumulation_steps
             is_sync_step = (local_step_rel % grad_accum == 0) or (local_step_rel == num_steps)
-            sync_context = nullcontext() if is_sync_step else self.model.no_sync()
+            sync_context = nullcontext() if is_sync_step else self.model.no_sync()  # type: ignore[operator]
 
             with sync_context:
                 scaled_loss = loss / grad_accum

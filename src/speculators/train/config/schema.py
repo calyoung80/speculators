@@ -406,8 +406,11 @@ class TrainerArgs(_Group):
     )
     checkpoint_step_interval: int | None = Field(
         default=None,
-        description="Save a checkpoint every N optimizer steps (overrides checkpoint_freq "
-        "when set). Useful for monitoring intermediate progress during long training runs.",
+        description=(
+            "Save a checkpoint every N optimizer steps (overrides checkpoint_freq "
+            "when set). Useful for monitoring intermediate progress during long "
+            "training runs."
+        ),
     )
     save_best: bool = Field(
         default=False,
