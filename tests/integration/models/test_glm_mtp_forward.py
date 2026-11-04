@@ -11,6 +11,9 @@ from torch import nn
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import (
     GlmMoeDsaConfig,
 )
+from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
+    GlmMoeDsaForCausalLM,
+)
 
 from speculators import SpeculatorsConfig, VerifierConfig
 from speculators.models.mtp import MTPDraftModel, MTPSpeculatorConfig, shift_batch_mtp
@@ -184,3 +187,57 @@ def test_backward_is_finite():
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert grads
     assert all(torch.isfinite(grad).all() for grad in grads)
+
+
+def test_single_optimizer_step_updates_parameters():
+    """Phase 6 CPU smoke: one backward + optimizer step stays finite."""
+    model = make_model()
+    model.train()
+    batch = shift_batch_mtp(make_batch(model))
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(trainable, lr=1e-2)
+    before = {name: param.detach().clone() for name, param in model.named_parameters()}
+
+    _, loss, _ = model(**batch, train_forward="fastmtp")
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    changed = [
+        name
+        for name, param in model.named_parameters()
+        if not torch.equal(before[name], param)
+    ]
+    assert changed
+    # ``verifier_lm_head`` keeps the NaN sentinel and is not trained.
+    assert all(torch.isfinite(param).all() for param in trainable)
+
+
+def test_checkpoint_save_reload_roundtrip(tmp_path):
+    """Phase 6 CPU smoke: save/reload reproduces tokens and loss bitwise."""
+    verifier_dir = tmp_path / "verifier"
+    torch.manual_seed(3)
+    GlmMoeDsaForCausalLM(load_tiny_config()).save_pretrained(verifier_dir)
+
+    model = make_model()
+    model.config.speculators_config.verifier.name_or_path = str(verifier_dir)
+    model.load_verifier_weights()
+    model.eval()
+    batch = shift_batch_mtp(make_batch(model))
+    with torch.no_grad():
+        expected_tokens, expected_loss, _ = model(**batch, train_forward="fastmtp")
+
+    draft_dir = tmp_path / "draft"
+    model.save_pretrained(draft_dir)
+    reloaded = MTPDraftModel.from_pretrained(draft_dir)
+    # from_pretrained re-resolves the attention implementation (config.json
+    # does not persist it) and the layer reads it at call time; pin sdpa to
+    # match make_model so the bitwise comparison cannot flip on a machine
+    # that has flash-attention installed.
+    reloaded.config.transformer_layer_config._attn_implementation = "sdpa"
+    reloaded.eval()
+    with torch.no_grad():
+        actual_tokens, actual_loss, _ = reloaded(**batch, train_forward="fastmtp")
+
+    assert torch.equal(expected_tokens[0], actual_tokens[0])
+    assert torch.equal(expected_loss, actual_loss)
