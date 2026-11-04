@@ -231,6 +231,10 @@ def test_fastmtp_forward_runs_for_glm():
     model = MTPDraftModel(make_speculator_config(load_tiny_config()))
     nn.init.normal_(model.embed_tokens.weight, std=0.02)
     nn.init.normal_(model.lm_head.weight, std=0.02)
+    # The upstream experts store uninitialized ``torch.empty`` weights and
+    # ``MTPDraftModel._init_weights`` does not know the GLM expert class.
+    nn.init.normal_(model.mtp_layers[0].mlp.experts.gate_up_proj, std=0.02)
+    nn.init.normal_(model.mtp_layers[0].mlp.experts.down_proj, std=0.02)
     model.eval()
 
     input_ids = torch.randint(0, 128, (1, 16))
