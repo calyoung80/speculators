@@ -19,9 +19,6 @@ import copy
 from typing import Any
 
 import torch
-
-from speculators.models.mtp.model_definitions import MTPLayerMixin
-
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import (
     GlmMoeDsaConfig,
 )
@@ -30,6 +27,8 @@ from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
     GlmMoeDsaRMSNorm,
 )
 
+from speculators.models.mtp.model_definitions import MTPLayerMixin
+
 __all__ = ["GlmMTPLayer"]
 
 
@@ -37,12 +36,23 @@ class GlmMTPLayer(MTPLayerMixin, GlmMoeDsaDecoderLayer):
     """Upstream GLM decoder layer plus the MTP input/final projections."""
 
     def __init__(self, config: GlmMoeDsaConfig, layer_idx: int = 0) -> None:
+        if config.head_dim != config.qk_rope_head_dim:
+            raise ValueError(
+                "GLM MTP expects head_dim == qk_rope_head_dim, got "
+                f"{config.head_dim} != {config.qk_rope_head_dim}."
+            )
+        if layer_idx != 0:
+            # The single-element indexer_types below are indexed by layer_idx
+            # upstream; the MTP head is always layer 0.
+            raise ValueError(
+                f"GlmMTPLayer expects layer_idx=0 (single MTP head), got {layer_idx}."
+            )
+
         modified = copy.copy(config)
         # The MTP head is a single sparse MoE block that must compute its own
         # DSA top-k mask (never reuse a previous layer's indices).
-        n_layers = max(layer_idx + 1, 1)
-        modified.indexer_types = ["full"] * n_layers
-        modified.mlp_layer_types = ["sparse"] * n_layers
+        modified.indexer_types = ["full"]
+        modified.mlp_layer_types = ["sparse"]
         modified._experts_implementation = "eager"  # noqa: SLF001
 
         super().__init__(modified, layer_idx)
@@ -69,7 +79,10 @@ class GlmMTPLayer(MTPLayerMixin, GlmMoeDsaDecoderLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        if position_ids is not None and token_embeddings.shape[:-1] == position_ids.shape:
+        if (
+            position_ids is not None
+            and token_embeddings.shape[:-1] == position_ids.shape
+        ):
             token_embeddings = token_embeddings.masked_fill(
                 (position_ids == 0).unsqueeze(-1), 0
             )
