@@ -1,0 +1,69 @@
+{
+  "exact": {
+    "model.layers.2.eh_proj.weight": "mtp_layers.0.input_proj.weight"
+  },
+  "fused_experts": {
+    "down_proj": "mtp_layers.0.mlp.experts.down_proj",
+    "gate_up_proj": "mtp_layers.0.mlp.experts.gate_up_proj"
+  },
+  "native_mtp_key_prefix": "model.layers.2.",
+  "prefix": [
+    [
+      "model.layers.2.enorm.",
+      "mtp_layers.0.token_layernorm."
+    ],
+    [
+      "model.layers.2.hnorm.",
+      "mtp_layers.0.hidden_layernorm."
+    ],
+    [
+      "model.layers.2.shared_head.norm.",
+      "mtp_layers.0.final_layernorm."
+    ],
+    [
+      "model.layers.2.",
+      "mtp_layers.0."
+    ]
+  ],
+  "source_keys_unused": [
+    "model.layers.2.embed_tokens.weight",
+    "model.layers.2.shared_head.head.weight"
+  ],
+  "source_keys_used": [
+    "model.layers.2.eh_proj.weight",
+    "model.layers.2.enorm.weight",
+    "model.layers.2.hnorm.weight",
+    "model.layers.2.input_layernorm.weight",
+    "model.layers.2.mlp.experts.0.down_proj.weight",
+    "model.layers.2.mlp.experts.0.gate_proj.weight",
+    "model.layers.2.mlp.experts.0.up_proj.weight",
+    "model.layers.2.mlp.experts.1.down_proj.weight",
+    "model.layers.2.mlp.experts.1.gate_proj.weight",
+    "model.layers.2.mlp.experts.1.up_proj.weight",
+    "model.layers.2.mlp.experts.2.down_proj.weight",
+    "model.layers.2.mlp.experts.2.gate_proj.weight",
+    "model.layers.2.mlp.experts.2.up_proj.weight",
+    "model.layers.2.mlp.experts.3.down_proj.weight",
+    "model.layers.2.mlp.experts.3.gate_proj.weight",
+    "model.layers.2.mlp.experts.3.up_proj.weight",
+    "model.layers.2.mlp.gate.e_score_correction_bias",
+    "model.layers.2.mlp.gate.weight",
+    "model.layers.2.mlp.shared_experts.down_proj.weight",
+    "model.layers.2.mlp.shared_experts.gate_proj.weight",
+    "model.layers.2.mlp.shared_experts.up_proj.weight",
+    "model.layers.2.post_attention_layernorm.weight",
+    "model.layers.2.self_attn.indexer.k_norm.bias",
+    "model.layers.2.self_attn.indexer.k_norm.weight",
+    "model.layers.2.self_attn.indexer.weights_proj.weight",
+    "model.layers.2.self_attn.indexer.wk.weight",
+    "model.layers.2.self_attn.indexer.wq_b.weight",
+    "model.layers.2.self_attn.kv_a_layernorm.weight",
+    "model.layers.2.self_attn.kv_a_proj_with_mqa.weight",
+    "model.layers.2.self_attn.kv_b_proj.weight",
+    "model.layers.2.self_attn.o_proj.weight",
+    "model.layers.2.self_attn.q_a_layernorm.weight",
+    "model.layers.2.self_attn.q_a_proj.weight",
+    "model.layers.2.self_attn.q_b_proj.weight",
+    "model.layers.2.shared_head.norm.weight"
+  ]
+}

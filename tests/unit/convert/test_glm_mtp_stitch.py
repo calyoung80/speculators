@@ -177,3 +177,20 @@ def test_stitch_does_not_add_missing_head_or_embed(tmp_path):
     stitched = load_file(str(output / "model.safetensors"))
     assert MTP_PREFIX + "shared_head.head.weight" not in stitched
     assert MTP_PREFIX + "embed_tokens.weight" not in stitched
+
+
+def test_stitch_rejects_layer_index_mismatch(tmp_path):
+    # A finetuned config claiming a different verifier depth than the native
+    # MTP head means the directories do not belong together.
+    native = build_native_mtp()
+    finetuned, _ = _make_finetuned(tmp_path, native)
+    config_path = finetuned / "config.json"
+    config = json.loads(config_path.read_text())
+    config["transformer_layer_config"]["num_hidden_layers"] = 3
+    config_path.write_text(json.dumps(config))
+    verifier = write_checkpoint(
+        tmp_path / "verifier", {**native, **build_non_mtp_weights()}
+    )
+
+    with pytest.raises(ValueError, match="num_hidden_layers"):
+        stitch(finetuned, verifier, tmp_path / "stitched")

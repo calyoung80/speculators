@@ -55,6 +55,7 @@ from speculators.convert.mtp.glm_layout import (
     GlmMtpPolicy,
     build_glm_layout,
     detect_glm_native_prefix,
+    verify_glm_layer_index,
     verify_glm_policy,
 )
 from speculators.convert.mtp.layout import NativeLayout
@@ -115,22 +116,26 @@ def _inverse_remap_key(key: str, layout: NativeLayout | None) -> str:
     return _remap_key(key)
 
 
-def _read_finetuned_model_type(checkpoint_dir: Path) -> str | None:
+def _read_finetuned_layer_config(checkpoint_dir: Path) -> dict:
+    """Read the transformer layer config of a finetuned speculators checkpoint."""
     config_path = checkpoint_dir / "config.json"
     if not config_path.exists():
-        return None
+        return {}
     with config_path.open() as f:
         config = json.load(f)
-    layer_config = config.get("transformer_layer_config") or {}
-    return layer_config.get("model_type") or config.get("model_type")
+    return config.get("transformer_layer_config") or config
 
 
 def _resolve_glm_layout(
     finetuned_checkpoint: Path, verifier_keys: set[str]
 ) -> NativeLayout | None:
-    if _read_finetuned_model_type(finetuned_checkpoint) != GLM_MODEL_TYPE:
+    layer_config = _read_finetuned_layer_config(finetuned_checkpoint)
+    if layer_config.get("model_type") != GLM_MODEL_TYPE:
         return None
     prefix = detect_glm_native_prefix(verifier_keys)
+    # Same wrong-verifier guard as the converter: the native MTP head must
+    # sit right after the verifier stack the finetuned model was built from.
+    verify_glm_layer_index(prefix, layer_config)
     policy = GlmMtpPolicy()
     verify_glm_policy(policy, verifier_keys, prefix)
     return build_glm_layout(prefix, policy)
