@@ -25,6 +25,7 @@ _MIN_TRANSFORMERS_VERSION: dict[str, str] = {
     "qwen3_next": "4.57.0",
     "qwen3_5_text": "5.2.0",
     "qwen3_5_moe_text": "5.2.0",
+    "glm_moe_dsa": "5.14.1",
 }
 
 
@@ -202,4 +203,23 @@ if "qwen3_5_moe_text" in base_components.model_classes:
     )
     mtp_model_classes["qwen3_5_moe_text"] = base_components.override_components(
         "qwen3_5_moe_text", first_layer_class=Qwen35MoeMTPLayer
+    )
+
+try:
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
+        GlmMoeDsaRMSNorm,
+        GlmMoeDsaRotaryEmbedding,
+    )
+
+    from speculators.models.mtp.glm_glue import GlmMTPLayer
+except ImportError:
+    # transformers < 5.14.1 does not ship glm_moe_dsa. ``resolve_model_type``
+    # turns this into a version error via ``_MIN_TRANSFORMERS_VERSION``.
+    pass
+else:
+    mtp_model_classes["glm_moe_dsa"] = base_components.ModelComponents(
+        first_layer_class=GlmMTPLayer,
+        decoder_layer_class=GlmMTPLayer,
+        norm_class=GlmMoeDsaRMSNorm,
+        rotary_emb_class=GlmMoeDsaRotaryEmbedding,
     )
