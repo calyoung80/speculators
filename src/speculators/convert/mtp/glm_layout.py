@@ -53,6 +53,20 @@ class GlmMtpPolicy:
     own_mtp_embed: bool = False
     own_mtp_final_norm: bool = True
     has_rot_weight: bool = False
+    # From the quant metadata.  ``None`` = not probed; a concrete value must
+    # agree with ``has_rot_weight`` or conversion/export is blocked (plan
+    # section 21.4, ``rot_gate_consistent``).
+    is_rot_used: bool | None = None
+
+
+# The three GLM MTP RMSNorm modules that may carry a quant-pack zero bias.
+# ``self_attn.indexer.k_norm`` is a LayerNorm with a real bias and must never
+# be dropped here.
+_GLM_MTP_NORM_BIAS_TARGETS = (
+    "mtp_layers.0.token_layernorm.bias",
+    "mtp_layers.0.hidden_layernorm.bias",
+    "mtp_layers.0.final_layernorm.bias",
+)
 
 
 def detect_glm_native_prefix(keys: Iterable[str]) -> str:
@@ -100,6 +114,24 @@ def build_glm_layout(prefix: str, policy: GlmMtpPolicy | None = None) -> NativeL
     )
 
 
+def verify_glm_layer_index(prefix: str, source_config: dict) -> None:
+    """Check that the native MTP head follows the verifier stack.
+
+    ``model.layers.<N>.*`` is the MTP head; ``N`` must equal the verifier's
+    ``num_hidden_layers`` (plan sections 17.4/21.6).
+    """
+    match = _NATIVE_LAYER_PATTERN.match(f"{prefix}eh_proj.weight")
+    if match is None:
+        raise ValueError(f"Invalid GLM MTP prefix {prefix!r}.")
+    layer_index = int(match.group(1))
+    num_hidden_layers = source_config.get("num_hidden_layers")
+    if num_hidden_layers is not None and layer_index != num_hidden_layers:
+        raise ValueError(
+            f"Native MTP layer index {layer_index} does not match "
+            f"num_hidden_layers={num_hidden_layers} for prefix '{prefix}'."
+        )
+
+
 def verify_glm_policy(
     policy: GlmMtpPolicy,
     keys: Iterable[str],
@@ -120,11 +152,28 @@ def verify_glm_policy(
             f"rot.weight presence ({has_rot}) does not match "
             f"has_rot_weight={policy.has_rot_weight} for prefix '{prefix}'."
         )
+    if policy.is_rot_used is not None and policy.is_rot_used != has_rot:
+        raise ValueError(
+            f"rot_gate_consistent=false: quant metadata is_rot_used="
+            f"{policy.is_rot_used} but rot.weight presence={has_rot} for "
+            f"prefix '{prefix}'."
+        )
     if has_rot:
         raise NotImplementedError(
             "GLM checkpoints with model.layers.<N>.rot.weight are not "
             "supported yet: GlmMTPLayer has no rot projection. Implement the "
             "Phase 1 rot fallback before converting this checkpoint."
+        )
+
+    if not policy.own_mtp_final_norm:
+        raise NotImplementedError(
+            "own_mtp_final_norm=false is not implemented yet: the training "
+            "model always owns mtp_layers.0.final_layernorm."
+        )
+    if f"{prefix}shared_head.norm.weight" not in key_set:
+        raise ValueError(
+            f"own_mtp_final_norm=True but '{prefix}shared_head.norm.weight' "
+            "is missing from the checkpoint."
         )
 
     has_head = f"{prefix}shared_head.head.weight" in key_set
@@ -150,6 +199,35 @@ def verify_glm_policy(
             "Independent GLM MTP embedding loading is not implemented yet; "
             "train/export with own_mtp_embed=false (shared verifier embed)."
         )
+
+
+def drop_glm_optional_norm_bias(
+    weights: dict,
+    layout: NativeLayout,
+) -> list[str]:
+    """Drop zero-valued optional RMSNorm biases from extracted GLM weights.
+
+    Returns the native keys that were dropped.  A non-zero bias means the
+    checkpoint does not follow the ``GlmMoeDsaRMSNorm`` contract and must be
+    rejected instead of silently ignored (plan section 9.2).  The DSA
+    indexer's LayerNorm ``k_norm.bias`` is a real parameter and is never in
+    the target list.
+    """
+    dropped: list[str] = []
+    for target in _GLM_MTP_NORM_BIAS_TARGETS:
+        tensor = weights.get(target)
+        if tensor is None:
+            continue
+        if tensor.count_nonzero().item() != 0:
+            native_key = layout.inverse_remap_key(target)
+            raise ValueError(
+                f"Non-zero optional RMSNorm bias at native key "
+                f"'{native_key}' ({target}); GlmMoeDsaRMSNorm has no bias. "
+                "Only an all-zero quant-pack placeholder may be dropped."
+            )
+        del weights[target]
+        dropped.append(layout.inverse_remap_key(target))
+    return dropped
 
 
 def build_glm_key_map(
@@ -223,7 +301,12 @@ def build_glm_native_manifest(
         "own_mtp_embed": policy.own_mtp_embed,
         "own_mtp_final_norm": policy.own_mtp_final_norm,
         "has_rot_weight": policy.has_rot_weight,
-        "is_rot_used": None,
+        "is_rot_used": policy.is_rot_used,
+        "rot_gate_consistent": (
+            None
+            if policy.is_rot_used is None
+            else policy.is_rot_used == policy.has_rot_weight
+        ),
         "index_share_for_mtp_iteration": source_config.get(
             "index_share_for_mtp_iteration", False
         ),

@@ -395,11 +395,15 @@ def test_convert_model_accepts_glm_kwargs(tmp_path, native):
         own_mtp_head=False,
         own_mtp_embed=False,
         has_rot_weight=False,
+        is_rot_used=False,
         quant_metadata_policy="copy-rebuild",
         key_map_out=str(key_map_out),
     )
 
     assert (output / "glm_native_manifest.json").exists()
+    manifest = json.loads((output / "glm_native_manifest.json").read_text())
+    assert manifest["is_rot_used"] is False
+    assert manifest["rot_gate_consistent"] is True
     assert json.loads(key_map_out.read_text())["native_mtp_key_prefix"] == MTP_PREFIX
 
 

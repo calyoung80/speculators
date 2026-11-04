@@ -89,6 +89,16 @@ def convert(
             help="Native checkpoint ships model.layers.<N>.rot.weight.",
         ),
     ] = None,
+    is_rot_used: Annotated[
+        bool | None,
+        typer.Option(
+            "--is-rot-used/--no-is-rot-used",
+            help=(
+                "Quant metadata claims the rot projection is used; must agree "
+                "with --has-rot-weight (rot_gate_consistent)."
+            ),
+        ),
+    ] = None,
     quant_metadata_policy: Annotated[
         str | None,
         typer.Option(
@@ -176,6 +186,7 @@ def convert(
             "own_mtp_head": own_mtp_head,
             "own_mtp_embed": own_mtp_embed,
             "has_rot_weight": has_rot_weight,
+            "is_rot_used": is_rot_used,
             "quant_metadata_policy": quant_metadata_policy,
             "key_map_out": key_map_out,
         }

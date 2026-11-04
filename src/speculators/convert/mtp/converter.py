@@ -27,6 +27,8 @@ from speculators.convert.mtp.glm_layout import (
     build_glm_layout,
     build_glm_native_manifest,
     detect_glm_native_prefix,
+    drop_glm_optional_norm_bias,
+    verify_glm_layer_index,
     verify_glm_policy,
 )
 from speculators.convert.mtp.layout import NativeLayout
@@ -119,6 +121,14 @@ class MTPConverter:
         if layout.name == GLM_MODEL_TYPE:
             self._source_config = load_checkpoint_config(local_path)
             glm_policy = self._effective_glm_policy(layout)
+            if glm_policy.is_rot_used is None:
+                logger.warning(
+                    "rot_gate_consistent is null: the quant metadata did not "
+                    "provide is_rot_used. Provide it via GlmMtpPolicy / "
+                    "--is-rot-used once the asset probe has run; Phase 3/7 "
+                    "gates require a concrete value."
+                )
+            verify_glm_layer_index(layout.native_prefixes[0], self._source_config)
             verify_glm_policy(
                 glm_policy,
                 all_keys,
@@ -127,6 +137,16 @@ class MTPConverter:
 
         self._dtypes = set()
         weights = self._extract_weights(local_path, all_keys, layout)
+        if layout.name == GLM_MODEL_TYPE:
+            # Quant packs may attach an all-zero RMSNorm bias; it has no
+            # training-side parameter, so drop it before fusion/save.
+            dropped = drop_glm_optional_norm_bias(weights, layout)
+            if dropped:
+                dropped_set = set(dropped)
+                self._source_keys_used = [
+                    key for key in self._source_keys_used if key not in dropped_set
+                ]
+                self._source_keys_unused = sorted({*self._source_keys_unused, *dropped})
         weights = self._fuse_moe_experts(weights, layout)
         self._layout = layout
 

@@ -48,6 +48,7 @@ def _mtp_converter_from_kwargs(kwargs: dict[str, Any]) -> MTPConverter:
     own_head = _coerce_bool(kwargs.pop("own_mtp_head", None), "own_mtp_head")
     own_embed = _coerce_bool(kwargs.pop("own_mtp_embed", None), "own_mtp_embed")
     has_rot = _coerce_bool(kwargs.pop("has_rot_weight", None), "has_rot_weight")
+    is_rot_used = _coerce_bool(kwargs.pop("is_rot_used", None), "is_rot_used")
     index_name = kwargs.pop("index_name", None)
     quant_policy = kwargs.pop("quant_metadata_policy", None)
 
@@ -58,11 +59,15 @@ def _mtp_converter_from_kwargs(kwargs: dict[str, Any]) -> MTPConverter:
         )
 
     policy = None
-    if any(value is not None for value in (prefix, own_head, own_embed, has_rot)):
+    if any(
+        value is not None
+        for value in (prefix, own_head, own_embed, has_rot, is_rot_used)
+    ):
         policy = GlmMtpPolicy(
             own_mtp_head=bool(own_head),
             own_mtp_embed=bool(own_embed),
             has_rot_weight=bool(has_rot),
+            is_rot_used=is_rot_used,
         )
     layout = (
         build_glm_layout(prefix, policy or GlmMtpPolicy())
@@ -133,7 +138,7 @@ def convert_model(
         Options for MTP: {"num_speculative_steps": 3}; GLM-MoE-DSA also accepts
         {"native_mtp_key_prefix": "model.layers.78.", "index_name":
         "quant_model_weights.safetensors.index.json", "own_mtp_head": false,
-        "own_mtp_embed": false, "has_rot_weight": false,
+        "own_mtp_embed": false, "has_rot_weight": false, "is_rot_used": false,
         "quant_metadata_policy": "copy-rebuild", "key_map_out": "glm_mtp_key_map.json"}.
         Options for DFlash: {"aux_hidden_state_layer_ids": [2,10,18,26,34]}.
     """
