@@ -206,6 +206,13 @@ class DataArgs(_Group):
         "arguments. Default: 'file'.",
         json_schema_extra=_CLI_CHOICES,
     )
+    capture_manifest: str | None = Field(
+        default=None,
+        description="Path to a teacher capture manifest (capture_manifest.json). "
+        "Pins the hidden-state stage so pre-norm captures get the frozen verifier "
+        "norm exactly once and post-norm captures are never re-normed (GLM MTP "
+        "sections 10.2/10.3).",
+    )
     total_seq_len: int = Field(
         default=8192, description="Maximum training sequence length, in tokens."
     )

@@ -21,6 +21,7 @@ from hs_connectors import HiddenStatesBackend
 from speculators.model import SpeculatorModel
 from speculators.models.eagle3.data import shift_batch
 from speculators.models.eagle3.rotary_partial import install_partial_neox_rotary
+from speculators.models.mtp.capture import CaptureManifest
 from speculators.models.mtp.data import shift_batch_mtp
 from speculators.models.utils import (
     get_verifier_config,
@@ -615,6 +616,42 @@ def build_draft_model(
     )
 
 
+def _resolve_capture_manifest(
+    args: argparse.Namespace, draft_model: SpeculatorModel
+) -> CaptureManifest | None:
+    """Load/validate the teacher capture manifest for MTP training.
+
+    Only MTP draft models understand ``hidden_state_stage``; rejecting the flag
+    for other algorithms avoids leaking an unknown forward kwarg.  Without a
+    manifest a post-norm capability cannot prove its capture stage, so warn
+    loudly instead of silently assuming FastMTP's no-norm behavior.
+    """
+    capability = getattr(draft_model, "mtp_capability", None)
+    manifest_path = getattr(args, "capture_manifest", None)
+    if manifest_path:
+        if capability is None:
+            raise ValueError(
+                "--capture-manifest is only supported for MTP draft models; "
+                f"got speculator_type={getattr(args, 'speculator_type', None)!r}."
+            )
+        manifest = CaptureManifest.from_path(manifest_path)
+        manifest.validate(
+            config=draft_model.config.transformer_layer_config,
+            verify_files=True,
+        )
+        return manifest
+
+    if capability is not None and capability.hidden_state_stage == "post_norm":
+        warnings.warn(
+            "GLM MTP captures are post-norm by default, but no "
+            "--capture-manifest was provided. The trainer cannot prove the "
+            "hidden-state stage and will run FastMTP without an extra norm; "
+            "pass the teacher capture manifest to make this explicit.",
+            stacklevel=2,
+        )
+    return None
+
+
 def main(cfg: TrainConfig):  # noqa: C901
     # Phase-1 adapter: the model layer still consumes a flat vars(args)-shaped
     # dict via **kwargs, so flatten the typed config back into a namespace here.
@@ -720,6 +757,11 @@ def main(cfg: TrainConfig):  # noqa: C901
 
     hidden_size = draft_model.config.transformer_layer_config.hidden_size
 
+    # The capture manifest is the only proof of what the teacher hidden states
+    # contain (plan section 10.2). Validate it against the verifier config here
+    # so the dataloader only has to attach the stage.
+    capture_manifest = _resolve_capture_manifest(args, draft_model)
+
     # Setup dataloaders
     preprocess_fns = {
         "eagle3": shift_batch,
@@ -758,6 +800,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
         seed=args.seed,
+        capture_manifest=capture_manifest,
     )
 
     # Get trainer kwargs from model class

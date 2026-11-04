@@ -1,6 +1,7 @@
 """Tests for CLI arguments."""
 
 import argparse
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,7 @@ from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.eagle3.core import Eagle3DraftModel
 from speculators.models.mtp.core import MTPDraftModel
 from speculators.models.peagle.core import PEagleDraftModel
+from speculators.train.cli import _resolve_capture_manifest
 from speculators.train.config import TrainConfig
 
 
@@ -279,3 +281,49 @@ def test_max_steps_explicit(monkeypatch):
 def test_max_steps_rejects_non_positive(monkeypatch):
     with pytest.raises(SystemExit):
         _parse(monkeypatch, ["--max-steps", "0"])
+
+
+# ---------------------------------------------------------------------------
+# --capture-manifest
+# ---------------------------------------------------------------------------
+
+
+def test_capture_manifest_default_is_none(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.capture_manifest is None
+
+
+def test_capture_manifest_explicit_path(monkeypatch):
+    args = _parse(monkeypatch, ["--capture-manifest", "capture_manifest.json"])
+    assert args.capture_manifest == "capture_manifest.json"
+
+
+# ---------------------------------------------------------------------------
+# capture manifest resolution (MTP only)
+# ---------------------------------------------------------------------------
+
+
+class _PostNormCapability:
+    hidden_state_stage = "post_norm"
+
+
+class _FakeMTPModel:
+    mtp_capability = _PostNormCapability()
+    config = SimpleNamespace(transformer_layer_config=None)
+
+
+def test_resolve_capture_manifest_is_noop_for_non_mtp():
+    args = SimpleNamespace(capture_manifest=None)
+    assert _resolve_capture_manifest(args, object()) is None
+
+
+def test_resolve_capture_manifest_rejects_non_mtp_flag():
+    args = SimpleNamespace(capture_manifest="manifest.json", speculator_type="eagle3")
+    with pytest.raises(ValueError, match="only supported for MTP"):
+        _resolve_capture_manifest(args, object())
+
+
+def test_resolve_capture_manifest_warns_for_post_norm_without_manifest():
+    args = SimpleNamespace(capture_manifest=None)
+    with pytest.warns(UserWarning, match="capture-manifest"):
+        assert _resolve_capture_manifest(args, _FakeMTPModel()) is None

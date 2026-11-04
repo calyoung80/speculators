@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 import os
 
@@ -13,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from hs_connectors import FileTransfer, HiddenStatesTransfer
 from speculators.data_generation.vllm_client import validate_vllm_model
+from speculators.models.mtp.capture import CaptureManifest
 from speculators.train.data import (
     ArrowDataset,
     SpeculatorsDataset,
@@ -113,6 +116,7 @@ def create_train_val_loaders(
     max_train_batches: int | None = None,
     seed: int = 0,
     max_transfer_workers: int = 1,
+    capture_manifest: str | Path | CaptureManifest | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -123,11 +127,47 @@ def create_train_val_loaders(
     ``seed`` sets the training packing order and must be the same on every
     rank. Validation keeps a fixed order, so runs with different seeds are
     validated on the same packed batches.
+
+    ``capture_manifest`` pins the teacher hidden-state stage.  Every collated
+    batch then carries ``hidden_state_stage`` so the MTP forward applies the
+    frozen verifier norm for ``pre_norm`` captures and skips it for
+    ``post_norm`` captures (plan section 10.2).  A path is loaded and hashed
+    here; an already-validated :class:`CaptureManifest` is trusted as-is so
+    large captures are not hashed twice.
     """
     _limit_worker_threads()
 
     if not (0.0 < train_data_ratio < 1.0):
         raise ValueError(f"train_data_ratio must be in (0, 1), got {train_data_ratio}")
+
+    manifest: CaptureManifest | None
+    if isinstance(capture_manifest, CaptureManifest):
+        # Already validated (including file hashes) by the caller; hashing large
+        # captures a second time would only add I/O.
+        manifest = capture_manifest
+    elif capture_manifest is not None:
+        manifest = CaptureManifest.from_path(capture_manifest)
+        manifest.validate(verify_files=True)
+    else:
+        manifest = None
+
+    hidden_state_stage: str | None = None
+    if manifest is not None:
+        if manifest.data["hidden_size"] != hidden_size:
+            raise ValueError(
+                "Capture manifest hidden_size does not match the training "
+                f"hidden size: {manifest.data['hidden_size']} != {hidden_size}."
+            )
+        expected_dtype = str(hidden_states_dtype).removeprefix("torch.")
+        if manifest.data["dtype"] != expected_dtype:
+            warnings.warn(
+                "Capture manifest dtype differs from the training data dtype: "
+                f"{manifest.data['dtype']!r} != {expected_dtype!r}; the loader "
+                "casts hidden states, but record the alignment dtype in the "
+                "gate report.",
+                stacklevel=1,
+            )
+        hidden_state_stage = manifest.hidden_state_stage
 
     train_records = ArrowDataset(
         datapath=data_path,
@@ -171,6 +211,7 @@ def create_train_val_loaders(
         hidden_states_dtype=hidden_states_dtype,
         num_target_layers=num_target_layers,
         preprocess=preprocess,
+        hidden_state_stage=hidden_state_stage,
     )
     val_dataset = SpeculatorsDataset(
         records=val_records,
@@ -180,6 +221,7 @@ def create_train_val_loaders(
         hidden_states_dtype=hidden_states_dtype,
         num_target_layers=num_target_layers,
         preprocess=preprocess,
+        hidden_state_stage=hidden_state_stage,
     )
 
     train_loader = _setup_dataloader(

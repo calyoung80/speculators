@@ -108,12 +108,19 @@ class SpeculatorsDataset(Dataset):
         hidden_states_dtype=torch.bfloat16,
         num_target_layers: int = 3,
         preprocess: Callable[[BatchType], BatchType] | None = None,
+        hidden_state_stage: str | None = None,
     ):
+        if hidden_state_stage not in (None, "pre_norm", "post_norm"):
+            raise ValueError(
+                "hidden_state_stage must be 'pre_norm', 'post_norm' or None, "
+                f"got {hidden_state_stage!r}."
+            )
         self.max_len = max_len
         self.hidden_size = hidden_size
         self.num_target_layers = num_target_layers
         self.preprocess = preprocess
         self.hidden_states_dtype = hidden_states_dtype
+        self.hidden_state_stage = hidden_state_stage
         self.records = records
         self.hidden_states = hidden_states
         self.approx_lengths = records.approx_lengths
@@ -221,6 +228,9 @@ class SpeculatorsDataset(Dataset):
                 dtype=self.hidden_states_dtype,
             )
             locally_empty = True
+
+        if self.hidden_state_stage is not None:
+            batch["hidden_state_stage"] = self.hidden_state_stage
 
         batch["error_records"] = len(unavailable)
         metadata = RecoveryMetadata.from_unavailable(
