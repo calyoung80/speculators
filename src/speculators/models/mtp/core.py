@@ -1,6 +1,7 @@
 """MTP speculator model implementation."""
 
 import logging
+from dataclasses import replace as _capability_replace
 from typing import Any, ClassVar, Literal
 
 import torch
@@ -13,6 +14,7 @@ from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.model import DraftVocabMixin
 from speculators.models.mtp.capabilities import (
     MTPCapability,
+    apply_glm_asset_facts,
     capability_ignore_keys,
     get_mtp_capability,
 )
@@ -230,7 +232,23 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
         tc = config.transformer_layer_config
-        self._mtp_capability = get_mtp_capability(tc.model_type)
+        capability = get_mtp_capability(tc.model_type)
+        if capability is not None:
+            # Per-asset facts ride on the speculator config (set by
+            # ``apply_glm_asset_facts`` from the native package itself).
+            overrides: dict[str, bool] = {}
+            if config.mtp_own_head and not capability.own_mtp_head:
+                overrides["own_mtp_head"] = True
+            if config.mtp_own_embed and not capability.own_mtp_embed:
+                overrides["own_mtp_embed"] = True
+            if config.mtp_has_rot and not capability.has_rot_weight:
+                overrides["has_rot_weight"] = True
+            if overrides:
+                capability = _capability_replace(capability, **overrides)
+            # The GLM glue layer reads the rot flag off the layer config.
+            if capability.has_rot_weight:
+                tc.mtp_has_rot = True
+        self._mtp_capability = capability
         self._model_definitions = mtp_model_classes[resolve_model_type(tc.model_type)]
         self.mtp_layers = nn.ModuleList(
             [self._model_definitions.first_layer_class(tc, layer_idx=0)]
@@ -286,7 +304,11 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         capability = self._mtp_capability
         if capability is None:
             return
-        if not (capability.own_mtp_head or capability.own_mtp_embed):
+        if not (
+            capability.own_mtp_head
+            or capability.own_mtp_embed
+            or capability.has_rot_weight
+        ):
             return
         if capability.shared_weight_loader is None:
             raise NotImplementedError(
@@ -324,7 +346,22 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             self.embed_tokens.weight.fill_(torch.nan)
             self.lm_head.weight.fill_(torch.nan)
         super().load_verifier_weights()
-        self._reject_silent_lm_head_fallback()
+        # Own head/embed/rot win over the verifier's shared vocab (plan
+        # section 8.2): re-apply the native tensors after the verifier
+        # materialization, since the verifier loader only knows the shared
+        # verifier head/embed.
+        capability = self._mtp_capability
+        owns_vocab = capability is not None and (
+            capability.own_mtp_head or capability.own_mtp_embed
+        )
+        if owns_vocab:
+            verifier_path = self.config.speculators_config.verifier.name_or_path
+            if verifier_path is not None:
+                self.load_shared_mtp_weights(verifier_path)
+        if capability is None or not capability.own_mtp_head:
+            # The own head replaces the fallback; only the shared-head path
+            # must reject an embedding-as-head silently.
+            self._reject_silent_lm_head_fallback()
         del self.verifier_lm_head
 
     def _reject_silent_lm_head_fallback(self) -> None:
@@ -774,6 +811,7 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
                 verifier=VerifierConfig.from_pretrained(verifier_name_or_path),
             ),
         )
+        apply_glm_asset_facts(config, verifier_name_or_path)
 
         model = cls(config=config)
 

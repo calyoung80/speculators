@@ -89,7 +89,7 @@ def test_zero_optional_norm_bias_is_dropped_and_nonzero_is_rejected(tmp_path):
         tmp_path / "bad-native", {**bad, **build_non_mtp_weights()}
     )
     with pytest.raises(ValueError, match="Non-zero optional RMSNorm bias"):
-        MTPConverter().convert(
+        MTPConverter(policy=GlmMtpPolicy()).convert(
             native_dir, tmp_path / "bad-converted", base_model=str(native_dir)
         )
 
@@ -116,7 +116,7 @@ def test_native_mtp_layer_index_must_match_depth(tmp_path):
     (native_dir / "config.json").write_text(json.dumps(config))
 
     with pytest.raises(ValueError, match="num_hidden_layers"):
-        MTPConverter().convert(
+        MTPConverter(policy=GlmMtpPolicy()).convert(
             native_dir, tmp_path / "converted", base_model=str(native_dir)
         )
 
@@ -136,7 +136,7 @@ FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "glm_mtp"
 def test_frozen_native_fixture_matches_stacked_reference(tmp_path, monkeypatch):
     native_dir = FIXTURES / "native_per_expert"
     converted = tmp_path / "converted"
-    MTPConverter().convert(
+    MTPConverter(policy=GlmMtpPolicy()).convert(
         native_dir, converted, base_model=str(native_dir), validate=True
     )
 

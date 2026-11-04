@@ -26,11 +26,13 @@ from speculators.convert.mtp.glm_layout import (
     build_glm_key_map,
     build_glm_layout,
     build_glm_native_manifest,
+    derive_glm_policy,
     detect_glm_native_prefix,
     drop_glm_optional_norm_bias,
     verify_glm_layer_index,
     verify_glm_policy,
 )
+from speculators.convert.mtp.glm_quant import fold_w8a8_siblings
 from speculators.convert.mtp.layout import NativeLayout
 from speculators.convert.utils import (
     ensure_checkpoint_is_local,
@@ -97,6 +99,8 @@ class MTPConverter:
         self._source_keys_used: list[str] = []
         self._source_keys_unused: list[str] = []
         self._dtypes: set[torch.dtype] = set()
+        self._last_glm_policy: GlmMtpPolicy | None = None
+        self._resolved_policy: GlmMtpPolicy | None = None
         self.last_key_map: dict | None = None
         self.last_manifest: dict | None = None
 
@@ -114,13 +118,14 @@ class MTPConverter:
 
         local_path = ensure_checkpoint_is_local(input_path, cache_dir)
         all_keys = list_checkpoint_keys(local_path, index_name=self._index_name)
-        layout = self._resolve_layout(all_keys)
+        layout = self._resolve_layout(all_keys, local_path)
         self._verify_mtp_format(all_keys, layout)
 
         glm_policy: GlmMtpPolicy | None = None
         if layout.name == GLM_MODEL_TYPE:
             self._source_config = load_checkpoint_config(local_path)
             glm_policy = self._effective_glm_policy(layout)
+            self._last_glm_policy = glm_policy
             if glm_policy.is_rot_used is None:
                 logger.warning(
                     "rot_gate_consistent is null: the quant metadata did not "
@@ -137,6 +142,18 @@ class MTPConverter:
 
         self._dtypes = set()
         weights = self._extract_weights(local_path, all_keys, layout)
+        # W8A8_DYNAMIC packages (customer w8a8c8): materialize int8 payloads
+        # that carry a weight_scale sibling; every remaining int8 tensor is a
+        # format error.
+        fold_w8a8_siblings(weights)
+        leftover_int8 = sorted(
+            key for key, tensor in weights.items() if tensor.dtype == torch.int8
+        )
+        if leftover_int8:
+            raise ValueError(
+                "Int8 weights without a weight_scale sibling cannot be "
+                f"materialized: {leftover_int8[:5]}"
+            )
         if layout.name == GLM_MODEL_TYPE:
             # Quant packs may attach an all-zero RMSNorm bias; it has no
             # training-side parameter, so drop it before fusion/save.
@@ -194,7 +211,9 @@ class MTPConverter:
         if validate:
             self._validate(saved_path)
 
-    def _resolve_layout(self, all_keys: list[str]) -> NativeLayout:
+    def _resolve_layout(
+        self, all_keys: list[str], checkpoint_dir: Path | None = None
+    ) -> NativeLayout:
         if self._layout is not None:
             return self._layout
         if any(key.startswith(_MTP_PREFIX) for key in all_keys):
@@ -204,9 +223,16 @@ class MTPConverter:
         except ValueError as exc:
             raise ValueError(
                 "No native MTP keys found. Expected keys starting with "
-                "'mtp.' (Qwen) or 'model.layers.<N>.eh_proj.weight' (GLM)."
+                "'mtp.' (Qwen) or 'model.layers.<N>.eh_proj.weight' / "
+                "'model.layers.<N>.shared_head.norm.weight' (GLM)."
             ) from exc
-        return build_glm_layout(prefix, self._policy or GlmMtpPolicy())
+        policy = self._policy
+        if policy is None:
+            # Derive the per-asset facts (own head/embed, rot sidecar, quant
+            # is_rot_used) from the package itself -- single source of truth.
+            policy = derive_glm_policy(all_keys, prefix, checkpoint_dir)
+            self._resolved_policy = policy
+        return build_glm_layout(prefix, policy)
 
     def _effective_glm_policy(self, layout: NativeLayout) -> GlmMtpPolicy:
         """Return the GLM policy, validated against the explicit layout.
@@ -216,7 +242,11 @@ class MTPConverter:
         save time (capability ignore list), so the two must agree.
         """
         prefix = layout.native_prefixes[0]
-        policy = self._policy or GlmMtpPolicy()
+        policy = (
+            self._policy
+            or getattr(self, "_resolved_policy", None)
+            or GlmMtpPolicy()
+        )
         mapped_head = f"{prefix}shared_head.head.weight" in layout.exact_remap
         mapped_embed = f"{prefix}embed_tokens.weight" in layout.exact_remap
         if policy.own_mtp_head != mapped_head or policy.own_mtp_embed != mapped_embed:
@@ -368,10 +398,18 @@ class MTPConverter:
     ) -> dict[str, torch.Tensor]:
         native_keys = [key for key in all_keys if layout.is_native_key(key)]
         needed = {key for key in native_keys if not layout.is_ignored(key)}
+        # W8A8 packages: pull the per-channel scale/offset siblings of every
+        # needed int8 weight so ``fold_w8a8_siblings`` can materialize them.
+        key_set = set(all_keys)
+        for key in sorted(needed):
+            if not key.endswith(".weight"):
+                continue
+            for suffix in ("_scale", "_offset"):
+                sibling = f"{key}{suffix}"
+                if sibling in key_set:
+                    needed.add(sibling)
         self._source_keys_used = sorted(needed)
-        self._source_keys_unused = sorted(
-            key for key in native_keys if layout.is_ignored(key)
-        )
+        self._source_keys_unused = sorted(set(native_keys) - needed)
 
         index_path, single = self._find_weights_file(checkpoint_dir)
         if index_path is not None:
@@ -483,6 +521,21 @@ class MTPConverter:
         return MTPSpeculatorConfig(
             transformer_layer_config=source_config,  # type: ignore[arg-type]
             speculators_config=speculators_config,
+            mtp_own_head=(
+                self._last_glm_policy.own_mtp_head
+                if self._last_glm_policy is not None
+                else False
+            ),
+            mtp_own_embed=(
+                self._last_glm_policy.own_mtp_embed
+                if self._last_glm_policy is not None
+                else False
+            ),
+            mtp_has_rot=(
+                self._last_glm_policy.has_rot_weight
+                if self._last_glm_policy is not None
+                else False
+            ),
         )
 
     def _save(

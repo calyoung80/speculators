@@ -206,15 +206,11 @@ def test_shared_weight_loader_runs_when_own_weights_are_declared(monkeypatch):
     assert calls[-1] == (model, "/tmp/other")
 
 
-def test_shared_weight_loader_requires_loader_when_own_weights_declared(
-    monkeypatch,
-):
-    capability = replace(MTP_CAPABILITIES["glm_moe_dsa"], own_mtp_head=True)
-    monkeypatch.setitem(MTP_CAPABILITIES, "glm_moe_dsa", capability)
-    model = MTPDraftModel(make_speculator_config(load_tiny_config()))
-
-    with pytest.raises(NotImplementedError, match="no shared-weight loader"):
-        model.load_shared_mtp_weights("/tmp/native")
+def test_shared_weight_loader_is_registered_for_glm():
+    # The GLM capability registers its native shared-weight loader so
+    # own-head/embed assets can materialize (plan section 8.2).
+    capability = MTP_CAPABILITIES["glm_moe_dsa"]
+    assert capability.shared_weight_loader is not None
 
 
 def test_vllm_train_forward_is_rejected_for_post_norm_capability():

@@ -19,6 +19,7 @@ import copy
 from typing import Any
 
 import torch
+from torch import nn
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import (
     GlmMoeDsaConfig,
 )
@@ -58,6 +59,16 @@ class GlmMTPLayer(MTPLayerMixin, GlmMoeDsaDecoderLayer):
         super().__init__(modified, layer_idx)
         self._setup_mtp_modules(modified, GlmMoeDsaRMSNorm)
 
+        # Optional rot projection (plan section 8.4): applied to the incoming
+        # verifier hidden states at the very start of the MTP forward, exactly
+        # like vllm-ascend's AscendDeepSeekMTP.  The weight arrives as
+        # ``mtp_layers.0.rot.weight`` (remapped from the native ``rot.weight``
+        # sidecar by the converter).  Rot-free layers must not carry the
+        # attribute at all (frozen contract: ``has_rot_weight=false`` means
+        # no rot module exists).
+        if getattr(modified, "mtp_has_rot", False):
+            self.rot = nn.Linear(modified.hidden_size, modified.hidden_size, bias=False)
+
         # Upstream builds these two norms without an eps argument (1e-6), while
         # the checkpoint and the rest of the decoder use ``rms_norm_eps``.
         for norm_name in ("q_a_layernorm", "kv_a_layernorm"):
@@ -79,6 +90,10 @@ class GlmMTPLayer(MTPLayerMixin, GlmMoeDsaDecoderLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        rot = getattr(self, "rot", None)
+        if rot is not None:
+            hidden_states = rot(hidden_states)
+
         if (
             position_ids is not None
             and token_embeddings.shape[:-1] == position_ids.shape

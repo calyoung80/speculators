@@ -54,6 +54,7 @@ from speculators.convert.mtp.glm_layout import (
     GLM_MODEL_TYPE,
     GlmMtpPolicy,
     build_glm_layout,
+    derive_glm_policy,
     detect_glm_native_prefix,
     verify_glm_layer_index,
     verify_glm_policy,
@@ -127,18 +128,23 @@ def _read_finetuned_layer_config(checkpoint_dir: Path) -> dict:
 
 
 def _resolve_glm_layout(
-    finetuned_checkpoint: Path, verifier_keys: set[str]
-) -> NativeLayout | None:
+    finetuned_checkpoint: Path,
+    verifier_keys: set[str],
+    verifier_path: Path,
+) -> tuple[GlmMtpPolicy | None, NativeLayout | None]:
     layer_config = _read_finetuned_layer_config(finetuned_checkpoint)
     if layer_config.get("model_type") != GLM_MODEL_TYPE:
-        return None
+        return None, None
     prefix = detect_glm_native_prefix(verifier_keys)
     # Same wrong-verifier guard as the converter: the native MTP head must
     # sit right after the verifier stack the finetuned model was built from.
     verify_glm_layer_index(prefix, layer_config)
-    policy = GlmMtpPolicy()
+    # Derive the per-asset policy from the verifier package itself (same
+    # source of truth as conversion) so export remaps head/embed/rot
+    # consistently with the training checkpoint.
+    policy = derive_glm_policy(verifier_keys, prefix, verifier_path)
     verify_glm_policy(policy, verifier_keys, prefix)
-    return build_glm_layout(prefix, policy)
+    return policy, build_glm_layout(prefix, policy)
 
 
 def _check_quant_siblings(
@@ -157,8 +163,10 @@ def _check_quant_siblings(
 
 def _filter_frozen_keys(
     weights: dict[str, torch.Tensor],
+    frozen: set[str] | None = None,
 ) -> dict[str, torch.Tensor]:
-    return {k: v for k, v in weights.items() if k not in _FROZEN_KEYS}
+    frozen = _FROZEN_KEYS if frozen is None else frozen
+    return {k: v for k, v in weights.items() if k not in frozen}
 
 
 def _unfuse_moe_experts(  # noqa: C901
@@ -368,13 +376,23 @@ def stitch(
 
     verifier_path = _resolve_verifier_path(verifier_path)
     verifier_keys = set(list_checkpoint_keys(verifier_path))
-    layout = _resolve_glm_layout(finetuned_checkpoint, verifier_keys)
+    glm_policy, layout = _resolve_glm_layout(
+        finetuned_checkpoint, verifier_keys, verifier_path
+    )
 
     weights = _load_finetuned_weights(finetuned_checkpoint)
     console.print(f"  Loaded [cyan]{len(weights)}[/] finetuned weight tensors")
 
-    frozen_count = sum(1 for k in weights if k in _FROZEN_KEYS)
-    weights = _filter_frozen_keys(weights)
+    # Own-head/embed checkpoints carry these weights trained values; they are
+    # written back into the native package instead of being skipped.
+    frozen = set(_FROZEN_KEYS)
+    if glm_policy is not None:
+        if glm_policy.own_mtp_head:
+            frozen.discard("lm_head.weight")
+        if glm_policy.own_mtp_embed:
+            frozen.discard("embed_tokens.weight")
+    frozen_count = sum(1 for k in weights if k in frozen)
+    weights = _filter_frozen_keys(weights, frozen)
     if frozen_count:
         console.print(
             f"  Skipped [yellow]{frozen_count}[/] frozen key(s) (embed_tokens, lm_head)"

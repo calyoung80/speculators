@@ -9,6 +9,7 @@ from safetensors.torch import load_file
 
 from speculators.cli.stitch import stitch
 from speculators.convert.mtp.converter import MTPConverter
+from speculators.convert.mtp.glm_layout import GlmMtpPolicy
 from speculators.models.mtp import MTPDraftModel
 from tests.unit.convert.glm_mtp_fixtures import (
     EXPERTS,
@@ -29,7 +30,7 @@ def _make_finetuned(
         tmp_path / "native", {**native, **build_non_mtp_weights()}
     )
     converted = tmp_path / "converted"
-    MTPConverter().convert(
+    MTPConverter(policy=GlmMtpPolicy()).convert(
         native_dir, converted, base_model=str(native_dir), validate=False
     )
     model = MTPDraftModel.from_pretrained(str(converted))

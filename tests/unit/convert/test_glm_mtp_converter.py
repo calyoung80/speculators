@@ -100,10 +100,22 @@ def test_rot_key_with_default_policy_raises():
         verify_glm_policy(GlmMtpPolicy(), keys, MTP_PREFIX)
 
 
-def test_policy_rot_present_is_not_implemented():
-    keys = list(build_native_mtp(include_rot=True))
-    with pytest.raises(NotImplementedError, match="rot projection"):
-        verify_glm_policy(GlmMtpPolicy(has_rot_weight=True), keys, MTP_PREFIX)
+def test_policy_rot_present_is_accepted():
+    # Both native rot storage forms pass the gate now that GlmMTPLayer owns
+    # the rot projection (plan section 8.4).
+    prefixed = list(build_native_mtp(include_rot=True))
+    verify_glm_policy(
+        GlmMtpPolicy(has_rot_weight=True, is_rot_used=True),
+        prefixed,
+        MTP_PREFIX,
+    )
+    sidecar = [key for key in prefixed if key != MTP_PREFIX + "rot.weight"]
+    sidecar.append("rot.weight")
+    verify_glm_policy(
+        GlmMtpPolicy(has_rot_weight=True, is_rot_used=True),
+        sidecar,
+        MTP_PREFIX,
+    )
 
 
 def test_policy_own_head_missing_raises(native):
@@ -112,9 +124,9 @@ def test_policy_own_head_missing_raises(native):
         verify_glm_policy(GlmMtpPolicy(own_mtp_head=True), keys, MTP_PREFIX)
 
 
-def test_policy_own_head_present_is_not_implemented(native):
-    with pytest.raises(NotImplementedError, match="Independent GLM MTP head"):
-        verify_glm_policy(GlmMtpPolicy(own_mtp_head=True), native, MTP_PREFIX)
+def test_policy_own_head_present_is_accepted(native):
+    # Independent head loading is implemented end to end (plan section 8.2).
+    verify_glm_policy(GlmMtpPolicy(own_mtp_head=True), native, MTP_PREFIX)
 
 
 def test_policy_own_embed_missing_raises(native):
@@ -123,9 +135,9 @@ def test_policy_own_embed_missing_raises(native):
         verify_glm_policy(GlmMtpPolicy(own_mtp_embed=True), keys, MTP_PREFIX)
 
 
-def test_policy_own_embed_present_is_not_implemented(native):
-    with pytest.raises(NotImplementedError, match="Independent GLM MTP embedding"):
-        verify_glm_policy(GlmMtpPolicy(own_mtp_embed=True), native, MTP_PREFIX)
+def test_policy_own_embed_present_is_accepted(native):
+    # Independent embedding loading is implemented end to end (plan 8.2).
+    verify_glm_policy(GlmMtpPolicy(own_mtp_embed=True), native, MTP_PREFIX)
 
 
 def test_layout_policy_mismatch_is_rejected(tmp_path, native):
@@ -152,7 +164,7 @@ def test_policy_without_layout_mapping_is_rejected(tmp_path, native):
 def test_convert_to_state_dict_fuses_experts(tmp_path, native):
     write_checkpoint(tmp_path / "native", native)
 
-    converter = MTPConverter()
+    converter = MTPConverter(policy=GlmMtpPolicy())
     state = converter.convert_to_state_dict(tmp_path / "native")
 
     gate_up, down = expected_fused_experts(native)
@@ -174,7 +186,7 @@ def test_convert_to_state_dict_fuses_experts(tmp_path, native):
 def test_convert_to_state_dict_reports_key_map(tmp_path, native):
     write_checkpoint(tmp_path / "native", native)
 
-    converter = MTPConverter()
+    converter = MTPConverter(policy=GlmMtpPolicy())
     converter.convert_to_state_dict(tmp_path / "native")
 
     key_map = converter.last_key_map
@@ -198,7 +210,7 @@ def test_quant_index_is_discovered(tmp_path, native):
         index_name=QUANT_INDEX,
     )
 
-    converter = MTPConverter()
+    converter = MTPConverter(policy=GlmMtpPolicy())
     state = converter.convert_to_state_dict(tmp_path / "native")
 
     assert "mtp_layers.0.mlp.experts.gate_up_proj" in state
@@ -223,7 +235,7 @@ def test_end_to_end_convert_writes_reports(tmp_path, native):
     )
     output = tmp_path / "converted"
 
-    MTPConverter().convert(
+    MTPConverter(policy=GlmMtpPolicy()).convert(
         native_dir, output, base_model=str(native_dir), validate=True
     )
 
@@ -262,7 +274,7 @@ def test_end_to_end_with_quant_index_verifier(tmp_path, native):
     )
     output = tmp_path / "converted"
 
-    MTPConverter().convert(
+    MTPConverter(policy=GlmMtpPolicy()).convert(
         native_dir, output, base_model=str(native_dir), validate=True
     )
 
@@ -307,7 +319,7 @@ def test_shape_mismatch_reports_native_key(tmp_path, native):
     native_dir = write_checkpoint(tmp_path / "native", broken)
 
     with pytest.raises(ValueError, match="Shape mismatch for native key"):
-        MTPConverter().convert(
+        MTPConverter(policy=GlmMtpPolicy()).convert(
             native_dir,
             tmp_path / "converted",
             base_model=str(native_dir),
@@ -324,7 +336,7 @@ def test_missing_expert_projection_raises(tmp_path, native):
         ValueError,
         match=r"model\.layers\.2\.mlp\.experts\.3\.down_proj\.weight",
     ):
-        MTPConverter().convert_to_state_dict(native_dir)
+        MTPConverter(policy=GlmMtpPolicy()).convert_to_state_dict(native_dir)
 
 
 def test_explicit_index_name_does_not_fall_back(tmp_path, native):
@@ -356,7 +368,7 @@ def test_mixed_dtypes_keep_fp32_master(tmp_path):
     native = build_native_mtp(dtype=torch.bfloat16)
     write_checkpoint(tmp_path / "native", native)
 
-    converter = MTPConverter()
+    converter = MTPConverter(policy=GlmMtpPolicy())
     converter.convert_to_state_dict(tmp_path / "native")
 
     assert converter.last_manifest is not None
@@ -372,7 +384,7 @@ def test_float8_source_is_rejected():
 def test_non_mtp_keys_are_not_consumed(tmp_path, native):
     write_checkpoint(tmp_path / "native", {**native, **build_non_mtp_weights()})
 
-    converter = MTPConverter()
+    converter = MTPConverter(policy=GlmMtpPolicy())
     state = converter.convert_to_state_dict(tmp_path / "native")
 
     assert not any(key.startswith("model.") for key in state)
@@ -456,7 +468,7 @@ def test_untied_glm_rejects_lm_head_fallback(tmp_path, native):
     native_dir = write_checkpoint(tmp_path / "native", native)
     output = tmp_path / "converted"
 
-    MTPConverter().convert(
+    MTPConverter(policy=GlmMtpPolicy()).convert(
         native_dir, output, base_model=str(native_dir), validate=False
     )
 

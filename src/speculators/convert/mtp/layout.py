@@ -23,7 +23,11 @@ class NativeLayout:
     ignored_suffixes: tuple[str, ...] = ()
 
     def is_native_key(self, key: str) -> bool:
-        return any(key.startswith(prefix) for prefix in self.native_prefixes)
+        # Exact-remap sources (e.g. the GLM top-level ``rot.weight`` sidecar)
+        # are native keys by definition even though they carry no prefix.
+        return key in self.exact_remap or any(
+            key.startswith(prefix) for prefix in self.native_prefixes
+        )
 
     def is_ignored(self, key: str) -> bool:
         if key in self.ignored_keys:

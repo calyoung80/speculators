@@ -52,6 +52,34 @@ class MTPSpeculatorConfig(SpeculatorModelConfig):
         ),
     )
 
+    mtp_own_head: bool = Field(
+        default=False,
+        description=(
+            "The native MTP layer owns an independent head "
+            "(``shared_head.head.weight`` distinct from the verifier's "
+            "``lm_head.weight``).  When true, the head is loaded from the "
+            "native package, saved with checkpoints, and written back by "
+            "stitch."
+        ),
+    )
+    mtp_own_embed: bool = Field(
+        default=False,
+        description=(
+            "The native MTP layer owns an independent token embedding "
+            "(``embed_tokens.weight`` distinct from the verifier's).  "
+            "Load/save/stitch semantics as for mtp_own_head."
+        ),
+    )
+    mtp_has_rot: bool = Field(
+        default=False,
+        description=(
+            "The native MTP layer carries a rot projection (top-level "
+            "``rot.weight`` sidecar or ``model.layers.<N>.rot.weight``).  "
+            "GlmMTPLayer applies it at the start of the MTP forward "
+            "(plan section 8.4)."
+        ),
+    )
+
     @property
     def hidden_size(self) -> int:
         return self.transformer_layer_config.hidden_size  # type: ignore[return-value]

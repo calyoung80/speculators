@@ -20,7 +20,11 @@ if TYPE_CHECKING:
 
 GLM_MODEL_TYPE = "glm_moe_dsa"
 
-_NATIVE_LAYER_PATTERN = re.compile(r"^model\.layers\.(\d+)\.eh_proj\.weight$")
+# Own-embed MTP variants (customer w8a8c8) ship ``embed_tokens`` /
+# ``shared_head.norm`` instead of the ``enorm``/``hnorm``/``eh_proj`` glue.
+_NATIVE_LAYER_PATTERN = re.compile(
+    r"^model\.layers\.(\d+)\.(?:eh_proj|shared_head\.norm|embed_tokens)\.weight$"
+)
 
 # Quantized checkpoints attach auxiliary tensors next to a float weight.  The
 # community fp8 package uses ``*.weight_scale_inv``; customer w4a8 builds may
@@ -70,13 +74,18 @@ _GLM_MTP_NORM_BIAS_TARGETS = (
 
 
 def detect_glm_native_prefix(keys: Iterable[str]) -> str:
-    """Return ``model.layers.{N}.`` for the GLM MTP head in ``keys``."""
+    """Return ``model.layers.{N}.`` for the GLM MTP head in ``keys``.
+
+    Both MTP variants are recognised: the glue form (``eh_proj``) and the
+    own-embed form (``shared_head.norm`` / ``embed_tokens``).
+    """
     for key in keys:
         match = _NATIVE_LAYER_PATTERN.match(key)
         if match:
             return f"model.layers.{match.group(1)}."
     raise ValueError(
-        "No GLM MTP head found. Expected a key like 'model.layers.<N>.eh_proj.weight'."
+        "No GLM MTP head found. Expected a key like 'model.layers.<N>."
+        "eh_proj.weight' or 'model.layers.<N>.shared_head.norm.weight'."
     )
 
 
@@ -97,6 +106,15 @@ def build_glm_layout(prefix: str, policy: GlmMtpPolicy | None = None) -> NativeL
         exact_remap[f"{prefix}embed_tokens.weight"] = "embed_tokens.weight"
     else:
         ignored_keys.append(f"{prefix}embed_tokens.weight")
+
+    if policy.has_rot_weight:
+        # Native GLM packages store the MTP rot projection either under the
+        # training-state prefix or as a top-level ``rot.weight`` sidecar (a
+        # dedicated ``rot.safetensors`` shard; vllm-ascend remaps ``rot.*`` to
+        # ``model.layers.<N>.rot.*`` at load).  Training state keeps it inside
+        # the MTP layer (plan section 8.4 / section 21 key map).
+        exact_remap["rot.weight"] = "mtp_layers.0.rot.weight"
+        exact_remap[f"{prefix}rot.weight"] = "mtp_layers.0.rot.weight"
 
     prefix_remap = (
         (f"{prefix}enorm.", "mtp_layers.0.token_layernorm."),
@@ -139,14 +157,12 @@ def verify_glm_policy(
 ) -> None:
     """Fail fast when the policy and the checkpoint disagree.
 
-    ``rot.weight`` presence must match the probe flag in both directions.
-    Independent head/embed storage is not implemented end-to-end yet (the
-    glue has no loader body), so it is rejected before training can silently
-    drop those tensors.
+    ``rot.weight`` presence must match the probe flag in both directions
+    (top-level sidecar and training-state prefix forms both count).
     """
     key_set = set(keys)
 
-    has_rot = f"{prefix}rot.weight" in key_set
+    has_rot = "rot.weight" in key_set or f"{prefix}rot.weight" in key_set
     if has_rot != policy.has_rot_weight:
         raise ValueError(
             f"rot.weight presence ({has_rot}) does not match "
@@ -158,12 +174,9 @@ def verify_glm_policy(
             f"{policy.is_rot_used} but rot.weight presence={has_rot} for "
             f"prefix '{prefix}'."
         )
-    if has_rot:
-        raise NotImplementedError(
-            "GLM checkpoints with model.layers.<N>.rot.weight are not "
-            "supported yet: GlmMTPLayer has no rot projection. Implement the "
-            "Phase 1 rot fallback before converting this checkpoint."
-        )
+    # rot is supported: GlmMTPLayer owns the projection and applies it at the
+    # start of the MTP forward (plan section 8.4); the layout remaps the
+    # native sidecar onto ``mtp_layers.0.rot.weight``.
 
     if not policy.own_mtp_final_norm:
         raise NotImplementedError(
@@ -176,28 +189,16 @@ def verify_glm_policy(
             "is missing from the checkpoint."
         )
 
-    has_head = f"{prefix}shared_head.head.weight" in key_set
-    if policy.own_mtp_head:
-        if not has_head:
-            raise ValueError(
-                f"own_mtp_head=True but '{prefix}shared_head.head.weight' "
-                "is missing from the checkpoint."
-            )
-        raise NotImplementedError(
-            "Independent GLM MTP head loading is not implemented yet; "
-            "train/export with own_mtp_head=false (shared verifier head)."
+    if policy.own_mtp_head and (f"{prefix}shared_head.head.weight" not in key_set):
+        raise ValueError(
+            f"own_mtp_head=True but '{prefix}shared_head.head.weight' "
+            "is missing from the checkpoint."
         )
 
-    has_embed = f"{prefix}embed_tokens.weight" in key_set
-    if policy.own_mtp_embed:
-        if not has_embed:
-            raise ValueError(
-                f"own_mtp_embed=True but '{prefix}embed_tokens.weight' "
-                "is missing from the checkpoint."
-            )
-        raise NotImplementedError(
-            "Independent GLM MTP embedding loading is not implemented yet; "
-            "train/export with own_mtp_embed=false (shared verifier embed)."
+    if policy.own_mtp_embed and (f"{prefix}embed_tokens.weight" not in key_set):
+        raise ValueError(
+            f"own_mtp_embed=True but '{prefix}embed_tokens.weight' "
+            "is missing from the checkpoint."
         )
 
 
@@ -228,6 +229,59 @@ def drop_glm_optional_norm_bias(
         del weights[target]
         dropped.append(layout.inverse_remap_key(target))
     return dropped
+
+
+def read_quant_is_rot_used(checkpoint_dir) -> bool | None:
+    """Read ``is_rot_used`` from the checkpoint's quant metadata.
+
+    Resolution order: ``quantization_config.json`` (``quantization_config``
+    subtree or top level), ``config.json`` (same), then the MindIE-style
+    ``quant_model_description.json`` (top-level key).  ``None`` = absent.
+    """
+    import json
+    from pathlib import Path
+
+    directory = Path(checkpoint_dir) if checkpoint_dir is not None else None
+    for name in (
+        "quantization_config.json",
+        "config.json",
+        "quant_model_description.json",
+    ):
+        path = directory / name if directory is not None else None
+        if path is None or not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        quant = raw.get("quantization_config") if isinstance(raw, dict) else None
+        if not isinstance(quant, dict):
+            quant = raw if isinstance(raw, dict) else {}
+        if "is_rot_used" in quant:
+            return bool(quant["is_rot_used"])
+    return None
+
+
+def derive_glm_policy(
+    keys: Iterable[str], prefix: str, checkpoint_dir=None
+) -> GlmMtpPolicy:
+    """Derive the GLM policy from the native package itself.
+
+    Key presence decides ``own_mtp_head`` / ``own_mtp_embed`` /
+    ``has_rot_weight`` (top-level ``rot.weight`` sidecar and training-state
+    prefix forms both count); ``is_rot_used`` comes from the quant metadata.
+    The verifier asset is the single source of truth -- converter, stitch and
+    ``MTPDraftModel.from_pretrained`` all derive the policy this way so a
+    mismatched hand-written policy cannot diverge from the checkpoint.
+    """
+    key_set = set(keys)
+    return GlmMtpPolicy(
+        own_mtp_head=f"{prefix}shared_head.head.weight" in key_set,
+        own_mtp_embed=f"{prefix}embed_tokens.weight" in key_set,
+        own_mtp_final_norm=True,
+        has_rot_weight="rot.weight" in key_set or f"{prefix}rot.weight" in key_set,
+        is_rot_used=read_quant_is_rot_used(checkpoint_dir),
+    )
 
 
 def build_glm_key_map(
