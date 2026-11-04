@@ -8,6 +8,15 @@ self-contained checkpoint directory deployable on vLLM.
 Frozen weights (embed_tokens, lm_head) are skipped -- only the MTP layer
 weights are replaced.
 
+GLM-MoE-DSA checkpoints are detected from the finetuned config and mapped
+back with the GLM inverse layout (per-expert experts,
+enorm/hnorm/eh_proj/shared_head.norm).  Both ``model.safetensors.index.json``
+and ``quant_model_weights.safetensors.index.json`` verifiers are supported
+and the original index filename is preserved.  Quantized verifiers are
+protected: float MTP weights are never written over quant metadata siblings,
+and every written tensor is cast back to the verifier's per-key dtype (so a
+BF16 native round-trip stays bitwise identical).
+
 Usage::
 
     speculators stitch-mtp ./finetuned-mtp ./Qwen3-Next-80B-A3B-Instruct
@@ -41,6 +50,15 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from speculators.convert.mtp import MTP_EXACT_REMAP, MTP_PREFIX_REMAP
+from speculators.convert.mtp.glm_layout import (
+    GLM_MODEL_TYPE,
+    GlmMtpPolicy,
+    build_glm_layout,
+    detect_glm_native_prefix,
+    verify_glm_policy,
+)
+from speculators.convert.mtp.layout import NativeLayout
+from speculators.utils.loading import SAFETENSORS_INDEX_NAMES, list_checkpoint_keys
 
 console = Console()
 
@@ -48,6 +66,14 @@ INVERSE_MTP_EXACT_REMAP = {v: k for k, v in MTP_EXACT_REMAP.items()}
 INVERSE_MTP_PREFIX_REMAP = [(dst, src) for src, dst in MTP_PREFIX_REMAP]
 
 _FROZEN_KEYS = {"embed_tokens.weight", "lm_head.weight"}
+
+_QUANT_SIBLING_SUFFIXES = (
+    "_scale_inv",
+    "_scale",
+    "_zero_point",
+    "_offset",
+    "_quant_bias",
+)
 
 _FUSED_GATE_UP_PATTERN = re.compile(r"^(.+\.experts)\.gate_up_proj$")
 _FUSED_DOWN_PATTERN = re.compile(r"^(.+\.experts)\.down_proj$")
@@ -81,6 +107,47 @@ def _remap_key(key: str) -> str:
         if key.startswith(src):
             return dst + key[len(src) :]
     return key
+
+
+def _inverse_remap_key(key: str, layout: NativeLayout | None) -> str:
+    if layout is not None:
+        return layout.inverse_remap_key(key)
+    return _remap_key(key)
+
+
+def _read_finetuned_model_type(checkpoint_dir: Path) -> str | None:
+    config_path = checkpoint_dir / "config.json"
+    if not config_path.exists():
+        return None
+    with config_path.open() as f:
+        config = json.load(f)
+    layer_config = config.get("transformer_layer_config") or {}
+    return layer_config.get("model_type") or config.get("model_type")
+
+
+def _resolve_glm_layout(
+    finetuned_checkpoint: Path, verifier_keys: set[str]
+) -> NativeLayout | None:
+    if _read_finetuned_model_type(finetuned_checkpoint) != GLM_MODEL_TYPE:
+        return None
+    prefix = detect_glm_native_prefix(verifier_keys)
+    policy = GlmMtpPolicy()
+    verify_glm_policy(policy, verifier_keys, prefix)
+    return build_glm_layout(prefix, policy)
+
+
+def _check_quant_siblings(
+    native_keys: set[str], present_keys: set[str], *, location: str
+) -> None:
+    for key in native_keys:
+        for suffix in _QUANT_SIBLING_SUFFIXES:
+            if key + suffix in present_keys:
+                raise NotImplementedError(
+                    f"Cannot stitch float MTP weight '{key}' over quantized "
+                    f"metadata at {location}: sibling '{key + suffix}' exists. "
+                    "Decide the bf16-vs-requant export policy first (plan "
+                    "section 19.2)."
+                )
 
 
 def _filter_frozen_keys(
@@ -203,21 +270,26 @@ def _load_finetuned_weights(
 def _stitch_sharded(
     output_dir: Path,
     native_weights: dict[str, torch.Tensor],
+    index_name: str,
 ) -> None:
-    index_path = output_dir / "model.safetensors.index.json"
+    index_path = output_dir / index_name
     with index_path.open() as f:
         index_data = json.load(f)
     weight_map: dict[str, str] = index_data["weight_map"]
 
+    missing = sorted(set(native_weights) - set(weight_map))
+    if missing:
+        raise ValueError(
+            "Finetuned keys not found in the verifier weight map: "
+            f"{missing}. The finetuned checkpoint may not match the verifier."
+        )
+    _check_quant_siblings(
+        set(native_weights), set(weight_map), location=str(index_path)
+    )
+
     shard_to_new: dict[str, dict[str, torch.Tensor]] = {}
     for key, tensor in native_weights.items():
-        shard = weight_map.get(key)
-        if shard is None:
-            raise ValueError(
-                f"Finetuned key '{key}' not found in verifier weight "
-                "map. The finetuned checkpoint may not match the "
-                "verifier."
-            )
+        shard = weight_map[key]
         shard_to_new.setdefault(shard, {})[key] = tensor
 
     with _bar() as progress:
@@ -231,11 +303,16 @@ def _stitch_sharded(
                 for k in f.keys():  # noqa: SIM118
                     existing[k] = f.get_tensor(k)
             for key, tensor in new_weights.items():
-                if key in existing and existing[key].shape != tensor.shape:
-                    raise ValueError(
-                        f"Shape mismatch for '{key}': verifier has "
-                        f"{existing[key].shape} but finetuned has {tensor.shape}"
-                    )
+                if key in existing:
+                    if existing[key].shape != tensor.shape:
+                        raise ValueError(
+                            f"Shape mismatch for '{key}': verifier has "
+                            f"{existing[key].shape} but finetuned has "
+                            f"{tensor.shape}"
+                        )
+                    # Export in the verifier's per-key dtype (bf16 native
+                    # weights, fp32 router buffers, ...).
+                    new_weights[key] = tensor.to(existing[key].dtype)
             existing.update(new_weights)
             save_file(existing, str(shard_path), metadata=metadata)
             progress.advance(task)
@@ -249,14 +326,21 @@ def _stitch_single(
     metadata = None
     with safe_open(str(safetensors_path), framework="pt") as f:
         metadata = f.metadata()
-        for k in f.keys():  # noqa: SIM118
+        present = set(f.keys())
+        _check_quant_siblings(
+            set(native_weights), present, location=str(safetensors_path)
+        )
+        for k in present:
             existing[k] = f.get_tensor(k)
-    for key, tensor in native_weights.items():
-        if key in existing and existing[key].shape != tensor.shape:
-            raise ValueError(
-                f"Shape mismatch for '{key}': verifier has "
-                f"{existing[key].shape} but finetuned has {tensor.shape}"
-            )
+    for key in list(native_weights):
+        tensor = native_weights[key]
+        if key in existing:
+            if existing[key].shape != tensor.shape:
+                raise ValueError(
+                    f"Shape mismatch for '{key}': verifier has "
+                    f"{existing[key].shape} but finetuned has {tensor.shape}"
+                )
+            native_weights[key] = tensor.to(existing[key].dtype)
     existing.update(native_weights)
     save_file(existing, str(safetensors_path), metadata=metadata)
 
@@ -278,6 +362,8 @@ def stitch(
     )
 
     verifier_path = _resolve_verifier_path(verifier_path)
+    verifier_keys = set(list_checkpoint_keys(verifier_path))
+    layout = _resolve_glm_layout(finetuned_checkpoint, verifier_keys)
 
     weights = _load_finetuned_weights(finetuned_checkpoint)
     console.print(f"  Loaded [cyan]{len(weights)}[/] finetuned weight tensors")
@@ -290,8 +376,13 @@ def stitch(
         )
 
     weights = _unfuse_moe_experts(weights)
-    native_weights = {_remap_key(k): v for k, v in weights.items()}
+    native_weights = {_inverse_remap_key(k, layout): v for k, v in weights.items()}
     console.print(f"  Remapped [cyan]{len(native_weights)}[/] keys to native format")
+
+    # Fail before copying the verifier so a rejected run leaves no output.
+    _check_quant_siblings(
+        set(native_weights), verifier_keys, location=str(verifier_path)
+    )
 
     if output_path.exists():
         console.print(
@@ -302,9 +393,16 @@ def stitch(
         progress.add_task("Copying verifier checkpoint", total=None)
         shutil.copytree(verifier_path, output_path, dirs_exist_ok=True)
 
-    index_path = output_path / "model.safetensors.index.json"
-    if index_path.exists():
-        _stitch_sharded(output_path, native_weights)
+    index_path = next(
+        (
+            output_path / name
+            for name in SAFETENSORS_INDEX_NAMES
+            if (output_path / name).exists()
+        ),
+        None,
+    )
+    if index_path is not None:
+        _stitch_sharded(output_path, native_weights, index_path.name)
     else:
         single = output_path / "model.safetensors"
         if single.exists():
