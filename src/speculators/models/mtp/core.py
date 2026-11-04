@@ -11,6 +11,11 @@ from transformers.masking_utils import create_causal_mask
 from speculators import SpeculatorModel
 from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.model import DraftVocabMixin
+from speculators.models.mtp.capabilities import (
+    MTPCapability,
+    capability_ignore_keys,
+    get_mtp_capability,
+)
 from speculators.models.mtp.config import MTPSpeculatorConfig
 from speculators.models.mtp.model_definitions import (
     mtp_model_classes,
@@ -225,6 +230,7 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
         tc = config.transformer_layer_config
+        self._mtp_capability = get_mtp_capability(tc.model_type)
         self._model_definitions = mtp_model_classes[resolve_model_type(tc.model_type)]
         self.mtp_layers = nn.ModuleList(
             [self._model_definitions.first_layer_class(tc, layer_idx=0)]
@@ -241,6 +247,64 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         self.verifier_norm.weight.requires_grad = False
 
         self.post_init()
+        self._apply_capability_checkpoint_ignore_keys()
+        self.freeze_capability_parameters()
+
+    @property
+    def mtp_capability(self) -> MTPCapability | None:
+        """Model-specific loader/freeze/checkpoint policy, if any."""
+        return self._mtp_capability
+
+    def _apply_capability_checkpoint_ignore_keys(self) -> None:
+        capability = self._mtp_capability
+        if capability is None:
+            return
+        self._keys_to_ignore_on_save = capability_ignore_keys(
+            self._keys_to_ignore_on_save, capability
+        )
+
+    def freeze_capability_parameters(self) -> None:
+        """Re-apply capability freezes after construction or native loading.
+
+        Only the DSA indexer is frozen here; the MTP input/final projections and
+        the decoder layer stay trainable.
+        """
+        capability = self._mtp_capability
+        if capability is None or not capability.freeze_indexer:
+            return
+        for name, parameter in self.named_parameters():
+            if ".indexer." in f".{name}.":
+                parameter.requires_grad = False
+
+    def load_shared_mtp_weights(self, weights_path: str | None = None) -> None:
+        """Load native shared head/embed weights when the capability owns them.
+
+        Generic models keep the verifier's ``embed_tokens`` / ``lm_head`` and
+        this is a no-op.  GLM (``own_mtp_head=false`` / ``own_mtp_embed=false``)
+        is therefore a no-op until a native package advertises otherwise.
+        """
+        capability = self._mtp_capability
+        if capability is None:
+            return
+        if not (capability.own_mtp_head or capability.own_mtp_embed):
+            return
+        if capability.shared_weight_loader is None:
+            raise NotImplementedError(
+                f"{capability.model_type} declares own head/embed weights but has "
+                "no shared-weight loader registered."
+            )
+        path = (
+            weights_path
+            if weights_path is not None
+            else capability.shared_mtp_weights_path
+        )
+        if path is None:
+            raise ValueError(
+                f"{capability.model_type} own head/embed loading requires a "
+                "native weights path."
+            )
+        capability.shared_weight_loader(self, path)
+        self.freeze_capability_parameters()
 
     @property
     def layers(self) -> nn.ModuleList:
@@ -319,12 +383,31 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             sequence-wide recursion on pre-norm hidden states. ``"vllm"`` trains the
             head the way vLLM's MTP proposer runs it: on the verifier's final-norm
             hidden states, with each draft step attending to the context plus only
-            its own draft chain (see ``_forward_ttt``).
+            its own draft chain (see ``_forward_ttt``). Capabilities declaring
+            ``hidden_state_stage="post_norm"`` (GLM's K=1 main path) reject
+            ``"vllm"``: their captures are already normed and the vLLM path
+            would double-normalize them.
         :return: ``(draft_tokens, loss, metrics)``. ``draft_tokens[k]`` holds the
             step-k greedy predictions at the supervised positions only.
         """
         if train_forward not in ("fastmtp", "vllm"):
             raise ValueError(f"Unknown MTP train_forward {train_forward!r}")
+        # ``verifier_norm`` reconstructs pre-norm hidden states. Post-norm
+        # captures (e.g. GLM's K=1 main path, §10.2 of the GLM MTP plan) must
+        # never be re-normed, so reject the vLLM-aligned path for them instead
+        # of silently double-normalizing.
+        capability = self._mtp_capability
+        if (
+            train_forward == "vllm"
+            and capability is not None
+            and capability.hidden_state_stage == "post_norm"
+        ):
+            raise ValueError(
+                f"{capability.model_type} trains on post-norm captures "
+                f"(hidden_state_stage={capability.hidden_state_stage!r}); "
+                "train_forward='vllm' applies verifier_norm and would "
+                "double-normalize. Use train_forward='fastmtp'."
+            )
         # The layer's attention reads its implementation at call time, including
         # in a gradient-checkpoint recompute during backward, so set it per forward
         # rather than restoring it afterwards. The FastMTP path builds its mask from
@@ -660,6 +743,9 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         model.load_state_dict(state_dict, strict=False)
 
         model.load_verifier_weights()
+        # No-op for generic MTP; models that own their head/embed load those
+        # native tensors here, after the verifier vocab has been materialized.
+        model.load_shared_mtp_weights(verifier_name_or_path)
         return model
 
     @staticmethod
