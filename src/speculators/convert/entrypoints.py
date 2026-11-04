@@ -12,9 +12,11 @@ Functions:
     convert_model: Converts a model checkpoint to the Speculators format.
 """
 
+import json
 import os
 import tempfile
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 
 from loguru import logger
 from transformers import PretrainedConfig
@@ -22,8 +24,52 @@ from transformers import PretrainedConfig
 from speculators.convert.dflash.converter import DFlashConverter
 from speculators.convert.eagle.eagle3_converter import Eagle3Converter
 from speculators.convert.mtp.converter import MTPConverter
+from speculators.convert.mtp.glm_layout import GlmMtpPolicy, build_glm_layout
 
 __all__ = ["convert_model", "maybe_convert_external_checkpoint"]
+
+
+def _coerce_bool(value: Any, flag: str) -> bool | None:
+    """Accept booleans and the common string spellings from JSON kwargs."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes"):
+            return True
+        if lowered in ("false", "0", "no"):
+            return False
+    raise ValueError(f"{flag} must be a boolean, got {value!r}")
+
+
+def _mtp_converter_from_kwargs(kwargs: dict[str, Any]) -> MTPConverter:
+    """Build an MTP converter from the MTP-only optional keyword arguments."""
+    prefix = kwargs.pop("native_mtp_key_prefix", None)
+    own_head = _coerce_bool(kwargs.pop("own_mtp_head", None), "own_mtp_head")
+    own_embed = _coerce_bool(kwargs.pop("own_mtp_embed", None), "own_mtp_embed")
+    has_rot = _coerce_bool(kwargs.pop("has_rot_weight", None), "has_rot_weight")
+    index_name = kwargs.pop("index_name", None)
+    quant_policy = kwargs.pop("quant_metadata_policy", None)
+
+    if quant_policy is not None and quant_policy != "copy-rebuild":
+        raise ValueError(
+            f"Unsupported quant_metadata_policy={quant_policy!r}; only "
+            "'copy-rebuild' is supported (in-place quantized shards are rejected)."
+        )
+
+    policy = None
+    if any(value is not None for value in (prefix, own_head, own_embed, has_rot)):
+        policy = GlmMtpPolicy(
+            own_mtp_head=bool(own_head),
+            own_mtp_embed=bool(own_embed),
+            has_rot_weight=bool(has_rot),
+        )
+    layout = (
+        build_glm_layout(prefix, policy or GlmMtpPolicy())
+        if prefix is not None
+        else None
+    )
+    return MTPConverter(layout=layout, policy=policy, index_name=index_name)
 
 
 def convert_model(
@@ -84,7 +130,11 @@ def convert_model(
     :param kwargs: Additional keyword arguments for the conversion algorithm.
         Options for Eagle3: {"norm_before_residual": true,
         "eagle_aux_hidden_state_layer_ids": [1,23,44]}.
-        Options for MTP: {"num_speculative_steps": 3}.
+        Options for MTP: {"num_speculative_steps": 3}; GLM-MoE-DSA also accepts
+        {"native_mtp_key_prefix": "model.layers.78.", "index_name":
+        "quant_model_weights.safetensors.index.json", "own_mtp_head": false,
+        "own_mtp_embed": false, "has_rot_weight": false,
+        "quant_metadata_policy": "copy-rebuild", "key_map_out": "glm_mtp_key_map.json"}.
         Options for DFlash: {"aux_hidden_state_layer_ids": [2,10,18,26,34]}.
     """
 
@@ -97,13 +147,21 @@ def convert_model(
             **kwargs,
         )
     elif algorithm == "mtp":
-        MTPConverter().convert(
+        converter = _mtp_converter_from_kwargs(kwargs)
+        key_map_out = kwargs.pop("key_map_out", None)
+        converter.convert(
             model,
             output_path,
             verifier,
             validate=validate_device is not None,
             **kwargs,
         )
+        if key_map_out is not None and converter.last_key_map is not None:
+            key_map_path = Path(key_map_out)
+            key_map_path.parent.mkdir(parents=True, exist_ok=True)
+            key_map_path.write_text(
+                json.dumps(converter.last_key_map, indent=2, sort_keys=True)
+            )
     elif algorithm == "dflash":
         DFlashConverter().convert(
             model,

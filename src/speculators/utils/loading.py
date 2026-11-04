@@ -8,6 +8,11 @@ from huggingface_hub.errors import EntryNotFoundError
 from loguru import logger
 from safetensors import safe_open
 
+SAFETENSORS_INDEX_NAMES: tuple[str, ...] = (
+    "model.safetensors.index.json",
+    "quant_model_weights.safetensors.index.json",
+)
+
 _WEIGHT_ALIASES: dict[str, list[str]] = {
     "embed_tokens.weight": [
         "tok_embeddings.weight",
@@ -66,29 +71,37 @@ def is_config_only_dir(path: str | Path) -> bool:
     return has_config and not has_weights
 
 
-def list_checkpoint_keys(checkpoint_dir: str | Path) -> list[str]:
+def list_checkpoint_keys(
+    checkpoint_dir: str | Path, index_name: str | None = None
+) -> list[str]:
     """List all tensor keys in a checkpoint without loading weights.
 
-    Supports sharded safetensors (via index) and single safetensors formats.
+    Supports sharded safetensors (via index, including the quantized
+    ``quant_model_weights.safetensors.index.json``) and single safetensors
+    formats.
 
     :param checkpoint_dir: Path to a local checkpoint directory.
+    :param index_name: Optional explicit index filename.
     :return: List of tensor key names present in the checkpoint.
     """
     checkpoint_dir = Path(checkpoint_dir)
 
-    index_path = checkpoint_dir / "model.safetensors.index.json"
-    if index_path.exists():
-        with index_path.open() as f:
-            return list(json.load(f)["weight_map"].keys())
+    index_names = (index_name,) if index_name else SAFETENSORS_INDEX_NAMES
+    for name in index_names:
+        index_path = checkpoint_dir / name
+        if index_path.exists():
+            with index_path.open() as f:
+                return list(json.load(f)["weight_map"].keys())
 
     single = checkpoint_dir / "model.safetensors"
     if single.exists():
         with safe_open(str(single), framework="pt") as f:
             return list(f.keys())
 
+    expected = ", ".join(index_names)
     raise FileNotFoundError(
         f"No safetensors checkpoint found at {checkpoint_dir}. "
-        "Expected model.safetensors.index.json or model.safetensors."
+        f"Expected {expected} or model.safetensors."
     )
 
 
@@ -106,14 +119,19 @@ def load_model_layers(
     :return: dict mapping input names/patterns to loaded tensors
     """
     # download the index file or build weight map for single-file models
-    try:
-        index_file = _resolve_file(model_path, "model.safetensors.index.json")
+    weight_map: dict[str, str] | None = None
+    for index_name in SAFETENSORS_INDEX_NAMES:
+        try:
+            index_file = _resolve_file(model_path, index_name)
+        except (FileNotFoundError, EntryNotFoundError):
+            continue
         with Path(index_file).open() as f:
-            index = json.load(f)
-        weight_map: dict[str, str] = index["weight_map"]
-    except (FileNotFoundError, EntryNotFoundError):
+            weight_map = json.load(f)["weight_map"]
+        break
+    if weight_map is None:
         logger.warning(
-            "`model.safetensors.index.json` file not found. "
+            "No safetensors index file found "
+            f"({', '.join(SAFETENSORS_INDEX_NAMES)}). "
             "Checking for `model.safetensors` instead."
         )
         model_file = _resolve_file(model_path, "model.safetensors")

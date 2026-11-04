@@ -51,6 +51,58 @@ def convert(
             ),
         ),
     ] = None,
+    native_mtp_key_prefix: Annotated[
+        str | None,
+        typer.Option(
+            "--native-mtp-key-prefix",
+            help="Native GLM MTP layer prefix, e.g. 'model.layers.78.'.",
+        ),
+    ] = None,
+    index_name: Annotated[
+        str | None,
+        typer.Option(
+            "--index-name",
+            help=(
+                "Safetensors index filename, e.g. "
+                "'quant_model_weights.safetensors.index.json'."
+            ),
+        ),
+    ] = None,
+    own_mtp_head: Annotated[
+        bool | None,
+        typer.Option(
+            "--own-mtp-head/--no-own-mtp-head",
+            help="Native checkpoint ships its own MTP LM head.",
+        ),
+    ] = None,
+    own_mtp_embed: Annotated[
+        bool | None,
+        typer.Option(
+            "--own-mtp-embed/--no-own-mtp-embed",
+            help="Native checkpoint ships its own MTP embedding.",
+        ),
+    ] = None,
+    has_rot_weight: Annotated[
+        bool | None,
+        typer.Option(
+            "--has-rot-weight/--no-has-rot-weight",
+            help="Native checkpoint ships model.layers.<N>.rot.weight.",
+        ),
+    ] = None,
+    quant_metadata_policy: Annotated[
+        str | None,
+        typer.Option(
+            "--quant-metadata-policy",
+            help="Quant metadata policy; only 'copy-rebuild' is supported.",
+        ),
+    ] = None,
+    key_map_out: Annotated[
+        str | None,
+        typer.Option(
+            "--key-map-out",
+            help="Write the GLM MTP native key map to this path.",
+        ),
+    ] = None,
     algorithm_kwargs: Annotated[
         dict[str, Any] | None,
         typer.Option(
@@ -87,12 +139,19 @@ def convert(
     \b
     algorithm=="mtp":
         MTP (Multi-Token Prediction): models with native MTP layers
-        (e.g. Qwen3-Next, Qwen3.5, Qwen3.5-MoE)
+        (e.g. Qwen3-Next, Qwen3.5, Qwen3.5-MoE, GLM-MoE-DSA)
         ::
         speculators convert "Qwen/Qwen3-Next-80B-A3B-Instruct" \\
             --algorithm mtp \\
             --verifier "Qwen/Qwen3-Next-80B-A3B-Instruct" \\
             --algorithm-kwargs '{"num_speculative_steps": 3}'
+        # GLM-MoE-DSA native head
+        speculators convert "/path/GLM-5.3" \\
+            --algorithm mtp \\
+            --verifier "/path/GLM-5.3" \\
+            --native-mtp-key-prefix "model.layers.78." \\
+            --index-name "quant_model_weights.safetensors.index.json" \\
+            --no-own-mtp-head --no-own-mtp-embed --no-has-rot-weight
 
     \b
     algorithm=="dflash":
@@ -108,6 +167,20 @@ def convert(
         raise typer.BadParameter(
             "--algorithm-kwargs must be a JSON object, not "
             + type(algorithm_kwargs).__name__
+        )
+
+    if algorithm == AlgorithmChoice.mtp:
+        glm_options = {
+            "native_mtp_key_prefix": native_mtp_key_prefix,
+            "index_name": index_name,
+            "own_mtp_head": own_mtp_head,
+            "own_mtp_embed": own_mtp_embed,
+            "has_rot_weight": has_rot_weight,
+            "quant_metadata_policy": quant_metadata_policy,
+            "key_map_out": key_map_out,
+        }
+        algorithm_kwargs.update(
+            {key: value for key, value in glm_options.items() if value is not None}
         )
 
     convert_model(
