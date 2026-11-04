@@ -324,7 +324,32 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             self.embed_tokens.weight.fill_(torch.nan)
             self.lm_head.weight.fill_(torch.nan)
         super().load_verifier_weights()
+        self._reject_silent_lm_head_fallback()
         del self.verifier_lm_head
+
+    def _reject_silent_lm_head_fallback(self) -> None:
+        """Refuse the embed-as-head fallback for untied capability models.
+
+        ``SpeculatorModel.load_verifier_weights`` silently reuses the
+        embedding matrix when the verifier has no ``lm_head.weight``.  That
+        is only valid for tied vocabularies; GLM is untied, so a missing head
+        must fail loudly instead of silently corrupting the draft head
+        (plan section 8.3).
+        """
+        capability = self._mtp_capability
+        if capability is None:
+            return
+        if getattr(self, "_lm_head_from_verifier", True):
+            return
+        if self.config.transformer_layer_config.tie_word_embeddings:
+            return
+        raise ValueError(
+            f"{capability.model_type} has tie_word_embeddings=False but the "
+            "verifier checkpoint has no resolvable 'lm_head.weight'; "
+            "refusing to silently reuse the embedding matrix as the LM head. "
+            "Provide a verifier with lm_head.weight, or implement "
+            "own_mtp_head."
+        )
 
     def _head_ce(
         self, hidden: torch.Tensor, targets: torch.Tensor

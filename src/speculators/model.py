@@ -164,6 +164,9 @@ class DraftVocabMixin(nn.Module):
 
         embed_tokens_weight = verifier_weights["embed_tokens.weight"]
         lm_head_weight = verifier_weights.get("lm_head.weight", embed_tokens_weight)
+        # Record whether the head really came from the verifier; subclasses
+        # can reject the embedding fallback for untied vocabularies.
+        self._lm_head_from_verifier = "lm_head.weight" in verifier_weights
 
         # Load embed_tokens if not already loaded (NaN means uninitialized)
         if overwrite_embed_tokens or self.embed_tokens.weight.isnan().any():
