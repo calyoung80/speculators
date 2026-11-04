@@ -412,27 +412,44 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             ``hidden_state_stage="post_norm"`` (GLM's K=1 main path) reject
             ``"vllm"``: their captures are already normed and the vLLM path
             would double-normalize them.
+        :param kwargs: ``hidden_state_stage`` (``"pre_norm"``/``"post_norm"``)
+            comes from the capture manifest. ``pre_norm`` captures are passed
+            through the frozen ``verifier_norm`` exactly once; ``post_norm``
+            captures are used as-is, so a manifest cannot double-normalize.
+            When omitted, the FastMTP behavior is unchanged (no implicit
+            norm).  A capability declaring ``post_norm`` rejects
+            ``train_forward="vllm"`` regardless of the explicit stage.
         :return: ``(draft_tokens, loss, metrics)``. ``draft_tokens[k]`` holds the
             step-k greedy predictions at the supervised positions only.
         """
         if train_forward not in ("fastmtp", "vllm"):
             raise ValueError(f"Unknown MTP train_forward {train_forward!r}")
+        hidden_state_stage = kwargs.pop("hidden_state_stage", None)
+        if hidden_state_stage not in (None, "pre_norm", "post_norm"):
+            raise ValueError(
+                "Unknown hidden_state_stage "
+                f"{hidden_state_stage!r}; expected 'pre_norm' or 'post_norm'."
+            )
         # ``verifier_norm`` reconstructs pre-norm hidden states. Post-norm
         # captures (e.g. GLM's K=1 main path, §10.2 of the GLM MTP plan) must
         # never be re-normed, so reject the vLLM-aligned path for them instead
-        # of silently double-normalizing.
+        # of silently double-normalizing.  For a post-norm capability the
+        # guard is absolute: an explicit ``pre_norm`` stage does not reopen
+        # the vLLM path (plan §17.9 keeps it a Phase 8 experiment).
         capability = self._mtp_capability
-        if (
-            train_forward == "vllm"
-            and capability is not None
-            and capability.hidden_state_stage == "post_norm"
+        if train_forward == "vllm" and (
+            (capability is not None and capability.hidden_state_stage == "post_norm")
+            or hidden_state_stage == "post_norm"
         ):
+            model_type = capability.model_type if capability is not None else "MTP"
             raise ValueError(
-                f"{capability.model_type} trains on post-norm captures "
-                f"(hidden_state_stage={capability.hidden_state_stage!r}); "
+                f"{model_type} trains on post-norm captures "
+                f"(hidden_state_stage={hidden_state_stage or 'capability'}); "
                 "train_forward='vllm' applies verifier_norm and would "
                 "double-normalize. Use train_forward='fastmtp'."
             )
+        if train_forward == "fastmtp" and hidden_state_stage == "pre_norm":
+            hidden_states = self.verifier_norm(hidden_states)
         # The layer's attention reads its implementation at call time, including
         # in a gradient-checkpoint recompute during backward, so set it per forward
         # rather than restoring it afterwards. The FastMTP path builds its mask from

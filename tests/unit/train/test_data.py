@@ -662,3 +662,31 @@ def test_getitems_keeps_valid_samples_when_one_generation_fails(tmp_path):
     client = source.client
     assert isinstance(client, _QueuedAsyncOpenAI)
     assert client.requests == [[1, 2, 3], [1, 2, 3]]
+
+
+def test_pad_samples_carries_agreeing_non_tensor_metadata():
+    """Run-level metadata (e.g. a capture stage) rides through collation."""
+    sample = {
+        "input_ids": torch.arange(2, dtype=torch.long),
+        "hidden_states": torch.randn(2, 4),
+        "lengths": torch.tensor([2], dtype=torch.long),
+    }
+    samples = [{**sample, "hidden_state_stage": "post_norm"} for _ in range(2)]
+    collated = _pad_samples(samples, 4, torch.float32)
+
+    assert collated["hidden_state_stage"] == "post_norm"
+
+
+def test_pad_samples_rejects_disagreeing_non_tensor_metadata():
+    sample = {
+        "input_ids": torch.arange(2, dtype=torch.long),
+        "hidden_states": torch.randn(2, 4),
+        "lengths": torch.tensor([2], dtype=torch.long),
+    }
+    batch = [
+        {**sample, "hidden_state_stage": "post_norm"},
+        {**sample, "hidden_state_stage": "pre_norm"},
+    ]
+
+    with pytest.raises(ValueError, match="differs across samples"):
+        _pad_samples(batch, 4, torch.float32)
