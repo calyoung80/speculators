@@ -23,6 +23,7 @@ from speculators.train.data import (
 from speculators.train.distributed import get_dp_rank, get_dp_size
 from speculators.train.distributed_batch_sampler import (
     MultipackDistributedBatchSamplerV2,
+    NoPackDistributedBatchSampler,
 )
 from speculators.train.hidden_states_source import (
     HiddenStatesSource,
@@ -72,14 +73,31 @@ def _setup_dataloader(
     max_batches: int | None = None,
     seed: int = 0,
 ) -> DataLoader:
-    batch_sampler = MultipackDistributedBatchSamplerV2(
-        batch_max_length=total_seq_len,
-        lengths=dataset.approx_lengths,
-        num_replicas=get_dp_size(),
-        rank=get_dp_rank(),
-        seed=seed,
-        max_batches=max_batches,
-    )
+    if os.environ.get("SPECULATORS_MTP_NO_PACK", "0") == "1":
+        # GLM K=1 main path (plan section 17.8): one sample per batch, no
+        # packing. Every rank derives the same fixed-generator permutation
+        # and shards it deterministically; the packing collate then sees a
+        # single document per batch, keeping the K=1 offset-slicing
+        # semantics visible (batch_size=1).
+        batch_sampler = NoPackDistributedBatchSampler(
+            lengths=dataset.approx_lengths,
+            num_replicas=get_dp_size(),
+            rank=get_dp_rank(),
+            seed=seed,
+            max_batches=max_batches,
+        )
+        logger.info(
+            "SPECULATORS_MTP_NO_PACK=1: single-sample batches (no packing)"
+        )
+    else:
+        batch_sampler = MultipackDistributedBatchSamplerV2(
+            batch_max_length=total_seq_len,
+            lengths=dataset.approx_lengths,
+            num_replicas=get_dp_size(),
+            rank=get_dp_rank(),
+            seed=seed,
+            max_batches=max_batches,
+        )
     use_workers = num_workers > 0
     return DataLoader(
         dataset,

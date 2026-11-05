@@ -255,3 +255,70 @@ class MultipackDistributedBatchSamplerV2(Sampler):
         # Cache result
         self._cached_generated_batches = (epoch, batches)
         return batches
+
+
+class NoPackDistributedBatchSampler(Sampler):
+    """Single-sample batches for the GLM K=1 NO_PACK main path.
+
+    ``SPECULATORS_MTP_NO_PACK=1`` selects this sampler from the dataloader:
+    every batch is exactly one sample (``batch_size=1``), deterministically
+    sharded across DP ranks.  The packing collate then emits a
+    single-document batch, so the K=1 forward's per-step offset slicing
+    operates on one capture at a time (plan sections 6 and 17.8).  ``seed``
+    drives a fixed numpy generator -- every rank derives the same global
+    permutation before the strided shard, training re-permutes per epoch
+    via ``set_epoch``, and validation keeps the caller's fixed order
+    (``seed=0``) so runs with different training seeds validate on the
+    same samples.  Samples longer than the collate ``max_len`` are
+    truncated there, mirroring the Multipack truncation policy.
+    """
+
+    def __init__(
+        self,
+        lengths: ArrayLike,
+        num_replicas: int,
+        rank: int,
+        seed: int = 0,
+        max_batches: int | None = None,
+    ):
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+        self.max_batches = max_batches
+        self.lengths = np.array(lengths)
+        self._cached_batches: tuple[int, list[NDArray]] = (-1, [])
+
+    def __iter__(self):
+        return iter(self._generate_batches(self.epoch))
+
+    def __len__(self):
+        return len(self._generate_batches(self.epoch))
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def _generate_batches(self, epoch: int) -> list[NDArray]:
+        if self._cached_batches[0] == epoch:
+            return self._cached_batches[1]
+
+        # Fixed generator: the permutation is identical on every rank, so
+        # the strided shard is a deterministic, disjoint partition.
+        rng = np.random.default_rng(seed=self.seed + epoch)
+        indices = rng.permutation(self.lengths.shape[0])
+
+        # Equal-count invariant: DDP collectives require the same number
+        # of batches on every rank (Multipack emits exactly one batch per
+        # rank per packing round).  Truncate the permutation so the strided
+        # shard gives each rank exactly floor(n / R) batches; the dropped
+        # tail (n mod R) rotates with the per-epoch permutation.
+        n_common = (indices.shape[0] // self.num_replicas) * self.num_replicas
+        batches = [
+            np.array([i])
+            for i in indices[:n_common][self.rank :: self.num_replicas]
+        ]
+        if self.max_batches is not None:
+            batches = batches[: self.max_batches]
+
+        self._cached_batches = (epoch, batches)
+        return batches

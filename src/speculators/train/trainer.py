@@ -136,7 +136,7 @@ class _StepTimer:
             "fetch_frac": fetch_ms / step_ms if step_ms > 0 else 0.0,
             "queue_ms": (m["queue"] - m["start"]) * 1000,
             "h2d_ms": (m["fetch"] - m["pre_h2d"]) * 1000,
-            "clip_ms": (m["bwd"] - m["pre_clip"]) * 1000,
+            "clip_ms": (m["bwd"] - m.get("pre_clip", m["bwd"])) * 1000,
         }
         if self._memory:
             result["memory_mb"] = dict(self._memory)
