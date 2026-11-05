@@ -3,10 +3,12 @@
 import argparse
 import gc
 import logging
+import os
 import random
 import warnings
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -555,12 +557,28 @@ def build_draft_model(
                 d2t=d2t,
                 verifier=args.verifier_name_or_path,
             )
-        return model_class.from_pretrained(
+        init_kwargs: dict[str, Any] = {}
+        # Env-gated init dtype: on large MoE drafts the fp32 pre-shard
+        # materialization exceeds a single accelerator; bf16 load keeps the
+        # construction peak at ~half (FSDP2 shards right after, so steady
+        # state is unaffected).  Post-shard fp32 upcast can be layered on the
+        # trainer side (SPECULATORS_UPCAST_FP32=1).  NOTE: the explicit
+        # `.to(dtype)` below is required — params synthesized outside the
+        # checkpoint load path (e.g. the fused MoE gate_up stack) ignore
+        # `torch_dtype` and stay at their fp32 construction dtype.
+        init_dtype = os.environ.get("SPECULATORS_INIT_DTYPE")
+        if init_dtype:
+            init_kwargs["torch_dtype"] = getattr(torch, init_dtype)
+        model = model_class.from_pretrained(
             args.from_pretrained,
             t2d=t2d,
             d2t=d2t,
             verifier=args.verifier_name_or_path,
+            **init_kwargs,
         )
+        if init_dtype:
+            model.to(getattr(torch, init_dtype))
+        return model
 
     if args.speculator_type == "mtp":
         # MTP uses the verifier's own decoder config as the draft

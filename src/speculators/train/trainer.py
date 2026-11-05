@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 import warnings
 from collections.abc import Callable
@@ -383,7 +384,31 @@ class Trainer:
         else:
             self._setup_model_ddp(load_checkpoint)
 
+    def _maybe_freeze_experts(self) -> None:
+        """Env-gated MoE expert freeze (``SPECULATORS_MTP_FREEZE_EXPERTS=1``).
+
+        A 256-expert MTP draft layer holds ~9.6B expert params as single
+        fused 12 GiB (bf16) parameters.  FSDP2 cannot shard a single fused
+        parameter finer, so backward holds a ~20 GiB unsharded grad buffer
+        for the layer unit on top of the ~20 GiB all-gather — beyond a 64
+        GiB accelerator.  Freezing the experts removes the grad buffer while
+        keeping their forward contribution; gate/head/attention/norms stay
+        trainable.  Intended for pipeline smokes; full-parameter runs need
+        per-expert parameter splitting or larger accelerators.
+        """
+        if os.environ.get("SPECULATORS_MTP_FREEZE_EXPERTS", "0") != "1":
+            return
+        frozen = 0
+        for name, param in self.model.named_parameters():
+            if ".mlp.experts" in name or ".mlp.shared_expert" in name:
+                param.requires_grad_(False)
+                frozen += 1
+        root_logger.info(
+            "SPECULATORS_MTP_FREEZE_EXPERTS=1: froze %d expert parameters", frozen
+        )
+
     def _setup_model_fsdp(self, load_checkpoint: bool):
+        self._maybe_freeze_experts()
         # Capture full state dict on rank 0 before FSDP sharding
         full_state_dict = {}
         if not load_checkpoint and dist.get_rank() == 0:
@@ -407,7 +432,17 @@ class Trainer:
             del full_state_dict
             dist.barrier()
 
+        # Env-gated: restore fp32 master weights after sharding.  Pairs with
+        # SPECULATORS_INIT_DTYPE=bfloat16 on the construction side — the
+        # pre-shard full fp32 materialization would exceed a single
+        # accelerator for large MoE drafts, so the model is built in bf16,
+        # sharded, and only then upcast (per-rank cost: one fp32 shard).
+        if os.environ.get("SPECULATORS_UPCAST_FP32", "0") == "1":
+            for param in self.model.parameters():
+                param.data = param.data.to(torch.float32)
+
     def _setup_model_ddp(self, load_checkpoint: bool):
+        self._maybe_freeze_experts()
         self.model.to(self.local_rank)  # type: ignore[arg-type]
 
         if load_checkpoint:

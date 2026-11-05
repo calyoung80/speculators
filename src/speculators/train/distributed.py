@@ -203,9 +203,17 @@ def apply_fully_sharded(
     Model should be validated with SpeculatorModel.verify_training_compatible()
     before calling this function.
     """
+    # Env-gated reduce dtype: the default fp32 grads keep a full unsharded
+    # fp32 gradient buffer per FSDP unit during backward — for a 256-expert
+    # MTP layer (~10B params) that is ~40 GiB per rank and OOMs a 64 GiB
+    # accelerator.  bf16 grads halve that; pair with fp32 master weights for
+    # formal runs once meta-init loading lands.
+    reduce_dtype = torch.float32
+    if os.environ.get("SPECULATORS_REDUCE_DTYPE") == "bfloat16":
+        reduce_dtype = torch.bfloat16
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
-        reduce_dtype=torch.float32,
+        reduce_dtype=reduce_dtype,
     )
 
     for layer in model.layers:  # type: ignore[union-attr]
