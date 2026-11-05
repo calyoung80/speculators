@@ -14,6 +14,7 @@ from speculators.models.mtp.core import MTPDraftModel
 from speculators.models.peagle.core import PEagleDraftModel
 from speculators.train.cli import _resolve_capture_manifest
 from speculators.train.config import TrainConfig
+from speculators.train.config.schema import FLEX_ATTENTION_BLOCK_SIZE
 
 
 def _parse(monkeypatch, extra: list[str]) -> argparse.Namespace:
@@ -327,3 +328,31 @@ def test_resolve_capture_manifest_warns_for_post_norm_without_manifest():
     args = SimpleNamespace(capture_manifest=None)
     with pytest.warns(UserWarning, match="capture-manifest"):
         assert _resolve_capture_manifest(args, _FakeMTPModel()) is None
+
+
+def test_flex_attention_block_size_matches_torch():
+    # The schema keeps its own copy to avoid importing torch, so check it here.
+    from torch.nn.attention.flex_attention import (  # noqa: PLC0415
+        _DEFAULT_SPARSE_BLOCK_SIZE,
+    )
+
+    assert FLEX_ATTENTION_BLOCK_SIZE == _DEFAULT_SPARSE_BLOCK_SIZE
+
+
+@pytest.mark.parametrize("total_seq_len", ["100", "200", "8191"])
+def test_eagle3_flex_rejects_unaligned_total_seq_len(monkeypatch, total_seq_len):
+    with pytest.raises(SystemExit):
+        _parse(monkeypatch, ["--total-seq-len", total_seq_len])
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--total-seq-len", "256"],
+        ["--total-seq-len", "200", "--draft-attn-impl", "sdpa"],
+        ["--total-seq-len", "200", "--speculator-type", "dflash"],
+    ],
+)
+def test_unaligned_total_seq_len_allowed_elsewhere(monkeypatch, extra):
+    args = _parse(monkeypatch, extra)
+    assert args.total_seq_len == int(extra[1])

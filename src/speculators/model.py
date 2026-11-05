@@ -168,6 +168,14 @@ class DraftVocabMixin(nn.Module):
         # can reject the embedding fallback for untied vocabularies.
         self._lm_head_from_verifier = "lm_head.weight" in verifier_weights
 
+        verifier_hidden_size = embed_tokens_weight.shape[-1]
+        draft_hidden_size = self.embed_tokens.embedding_dim
+        if verifier_hidden_size != draft_hidden_size:
+            raise ValueError(
+                f"Verifier hidden size {verifier_hidden_size} does not match"
+                f" draft hidden size {draft_hidden_size}."
+            )
+
         # Load embed_tokens if not already loaded (NaN means uninitialized)
         if overwrite_embed_tokens or self.embed_tokens.weight.isnan().any():
             self.embed_tokens.load_state_dict({"weight": embed_tokens_weight})
