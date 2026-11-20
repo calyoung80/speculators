@@ -129,7 +129,10 @@ def load_file_views(path: Any) -> dict[str, torch.Tensor] | None:
             if t_dt is not None:
                 t = t.view(t_dt)
             shape = meta.get("shape") or []
-            t = t.reshape(shape)
+            if count and shape:
+                t = t.view(*shape)
+            else:
+                t = t.reshape(shape)
             try:
                 setattr(t, "_hs_holder", holder)
             except Exception:

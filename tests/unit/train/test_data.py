@@ -262,6 +262,7 @@ class _QueuedAsyncOpenAI:
         self.requests: list[list[int]] = []
         self.active_requests = 0
         self.max_active_requests = 0
+        self.close_calls = 0
         self.completions = self
 
     async def create(self, *, prompt, **_kwargs):
@@ -277,7 +278,12 @@ class _QueuedAsyncOpenAI:
         )
 
     async def close(self):
-        return None
+        self.close_calls += 1
+
+
+def _use_client(source, client):
+    source._make_client = lambda: client  # type: ignore[method-assign]
+    source._test_client = client
 
 
 def _make_generation_dataset(
@@ -314,7 +320,7 @@ def _make_generation_dataset(
         hidden_size=4,
         num_target_layers=kwargs.pop("num_target_layers", 1),
     )
-    source.client = _QueuedAsyncOpenAI(handles)  # type: ignore[assignment]
+    _use_client(source, _QueuedAsyncOpenAI(handles))
     return dataset
 
 
@@ -373,7 +379,7 @@ def test_vllm_source_workers_overlap_requests():
         generation_validation_retries=0,
     )
     client = _QueuedAsyncOpenAI(["0", "1"])
-    source.client = client  # type: ignore[assignment]
+    _use_client(source, client)
     records = [
         DatasetRecord(
             input_ids=torch.tensor([1, 2, 3]),
@@ -388,6 +394,7 @@ def test_vllm_source_workers_overlap_requests():
     source.close()
 
     assert client.max_active_requests == 2
+    assert client.close_calls == 1
 
 
 def test_speculators_dataset_getitems_builds_collated_batch(tmp_path):
@@ -481,25 +488,15 @@ def test_offline_hidden_states_source_raises_on_cache_miss():
 
 
 def test_vllm_hidden_states_source_close_is_idempotent():
-    class CloseableClient:
-        def __init__(self):
-            self.close_calls = 0
-
-        async def close(self):
-            self.close_calls += 1
-
     source = source_module.VllmHiddenStatesSource(
         transfer=object(),  # type: ignore[arg-type]
         model="model",
     )
-    client = CloseableClient()
-    source.client = client  # type: ignore[assignment]
 
     source.close()
     source.close()
 
-    assert client.close_calls == 1
-    assert source.client is None
+    assert source._transfer_executor is None
 
 
 def test_arrow_dataset_retries_nonfinite_read_then_recovers(tmp_path, caplog):
@@ -523,7 +520,7 @@ def test_arrow_dataset_retries_nonfinite_read_then_recovers(tmp_path, caplog):
     assert transfer.deleted == ["bad-handle", "good-handle"]
     assert isinstance(arrow_ds.hidden_states, source_module.VllmHiddenStatesSource)
     assert arrow_ds.hidden_states.generation_recovery.consecutive_failures == 0
-    client = arrow_ds.hidden_states.client
+    client = arrow_ds.hidden_states._test_client
     assert isinstance(client, _QueuedAsyncOpenAI)
     assert client.requests == [[1, 2, 3], [1, 2, 3]]
 
@@ -659,6 +656,6 @@ def test_getitems_keeps_valid_samples_when_one_generation_fails(tmp_path):
     assert collated["loss_mask"].sum() == 3
     assert torch.equal(collated["input_ids"][0, :3], torch.tensor([1, 2, 3]))
     source = cast("source_module.VllmHiddenStatesSource", dataset.hidden_states)
-    client = source.client
+    client = source._test_client
     assert isinstance(client, _QueuedAsyncOpenAI)
     assert client.requests == [[1, 2, 3], [1, 2, 3]]

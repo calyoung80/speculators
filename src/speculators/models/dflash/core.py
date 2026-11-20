@@ -13,7 +13,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from speculators.losses import LossConfig, resolve_loss_config
 from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.attention import create_float_mask
-from speculators.models.dflash import DFlashSpeculatorConfig
+from speculators.models.dflash import DFlashSpeculatorConfig  # [DEEP_PROFILE]
+from speculators.models.dflash import deep_profile as dp
 from speculators.models.dflash.attention import create_anchor_block_mask_mod
 from speculators.models.dflash.metrics import compute_metrics
 from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
@@ -394,6 +395,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         anchored_block_indices)``. DSpark reuses this and adds its Markov and
         confidence heads before computing its own loss.
         """
+        dp.begin("forward")  # [DEEP_PROFILE]
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
         num_anchors = kwargs.pop("max_anchors", 512)
@@ -403,9 +405,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 total_seq_len, dtype=torch.long, device=device
             ).unsqueeze(0)
 
+        dp.begin("build_mask")  # [DEEP_PROFILE]
         full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
             self._build_attention_mask(loss_mask, num_anchors, document_ids, device)
         )
+        dp.end("build_mask")
 
         mask_tokens_size = num_anchors * self.block_size
 
@@ -419,8 +423,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         noise_embedding = self.embed_tokens(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
+        dp.begin("fc")  # [DEEP_PROFILE]
         fc_output = self.fc(hidden_states)
         fc_output = self.hidden_norm(fc_output)
+        dp.end("fc")
         # shape: [1, total_seq_len, hidden_size]
 
         mask_position_ids = get_base_indices_for_anchored_blocks(
@@ -437,6 +443,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             anchor_positions, self.block_size
         )  # shape: [num_anchors*block_size]
 
+        dp.begin("verifier_lm_head")  # [DEEP_PROFILE]
         with torch.no_grad():
             if anchored_block_indices.numel() < total_seq_len:
                 target_indices = (
@@ -456,6 +463,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 targets = verifier_logits[:, anchored_block_indices]
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
+        dp.end("verifier_lm_head")
+        dp.begin("layers")  # [DEEP_PROFILE]
         for layer_idx, layer in enumerate(self.layers):
             noise_embedding = layer(
                 hidden_states=noise_embedding,
@@ -471,8 +480,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 **kwargs,
             )
 
+        dp.end("layers")
+        dp.begin("norm_lm_head")  # [DEEP_PROFILE]
         hidden = self.norm(noise_embedding)
         logits = self.lm_head(hidden)
+        dp.end("norm_lm_head")
+        dp.end("forward")
         # shape: [1, num_anchors*block_size, vocab_size]
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]

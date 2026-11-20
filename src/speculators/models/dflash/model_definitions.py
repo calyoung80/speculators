@@ -17,6 +17,8 @@ from typing_extensions import Unpack
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+from . import deep_profile as dp  # [DEEP_PROFILE]
+
 
 # Local copy of rotate_half to avoid dependency on internal transformers functions
 def _rotate_half(x):
@@ -109,14 +111,24 @@ class Qwen3DFlashAttention(nn.Module):
         # length + block size)
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
+        dp.begin("q_proj")  # [DEEP_PROFILE]
         q = self.q_proj(hidden_states)
+        dp.end("q_proj")
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
         # This is the main difference from the usual attention mechanism.
+        dp.begin("k_ctx")  # [DEEP_PROFILE]
         k_ctx = self.k_proj(target_hidden)
+        dp.end("k_ctx")
+        dp.begin("k_noise")  # [DEEP_PROFILE]
         k_noise = self.k_proj(hidden_states)
+        dp.end("k_noise")
+        dp.begin("v_ctx")  # [DEEP_PROFILE]
         v_ctx = self.v_proj(target_hidden)
+        dp.end("v_ctx")
+        dp.begin("v_noise")  # [DEEP_PROFILE]
         v_noise = self.v_proj(hidden_states)
+        dp.end("v_noise")
         k = torch.cat([k_ctx, k_noise], dim=1).view(
             bsz, ctx_len + q_len, -1, self.head_dim
         )
@@ -139,6 +151,7 @@ class Qwen3DFlashAttention(nn.Module):
             attn_fn = ALL_ATTENTION_FUNCTIONS[
                 self.config._attn_implementation  # noqa: SLF001
             ]
+        dp.begin("attn")  # [DEEP_PROFILE]
         attn_output, attn_weights = attn_fn(
             self,
             q,
@@ -150,8 +163,11 @@ class Qwen3DFlashAttention(nn.Module):
             sliding_window=self.sliding_window,
             **kwargs,
         )
+        dp.end("attn")  # [DEEP_PROFILE]
         attn_output = attn_output.reshape(bsz, q_len, -1)
+        dp.begin("o_proj")  # [DEEP_PROFILE]
         attn_output = self.o_proj(attn_output)
+        dp.end("o_proj")
         return attn_output, attn_weights
 
 
@@ -186,8 +202,10 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         # passes the extra hidden states to the self attention from the verifier model.
         # Note that target_hidden is not modified here.
         assert hidden_states is not None  # noqa: S101
+        dp.begin("layer_total")  # [DEEP_PROFILE]
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        dp.begin("layer_attn")  # [DEEP_PROFILE]
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
@@ -200,8 +218,12 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )[0]
+        dp.end("layer_attn")  # [DEEP_PROFILE]
         hidden_states = residual + hidden_states  # type: ignore[operator]
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        dp.begin("mlp")  # [DEEP_PROFILE]
         hidden_states = self.mlp(hidden_states)
+        dp.end("mlp")
+        dp.end("layer_total")
         return residual + hidden_states  # type: ignore[operator]

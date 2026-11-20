@@ -1,6 +1,7 @@
 """Hidden-state acquisition for training data."""
 
 import asyncio
+import gc
 import logging
 import warnings
 from collections.abc import Sequence
@@ -127,10 +128,16 @@ class VllmHiddenStatesSource:
         self.request_timeout = request_timeout
         self.max_retries = max_retries
         self.max_transfer_workers = max_transfer_workers
-        self.client: openai.AsyncOpenAI | None = None
-        self._runner: asyncio.Runner | None = None
         self._transfer_executor: ThreadPoolExecutor | None = None
         self._is_setup = False
+        # r8 (2026-11-06): bound Mooncake engine host-memory retention.
+        # Each get_into on a producer-originated object can leave one
+        # payload-sized anonymous mapping that the engine only returns
+        # after the calling threads exit and a fresh event loop is created
+        # and closed (probes E/O1 on s96). Recycle the transfer executor
+        # every executor_recycle_interval loaded samples.
+        self._loads_since_recycle = 0
+        self.executor_recycle_interval = 4
         self.generation_recovery = GenerationRecoveryGuard(
             retries=generation_validation_retries,
             max_consecutive_failures=max_consecutive_generation_failures,
@@ -140,21 +147,42 @@ class VllmHiddenStatesSource:
         if self._is_setup:
             return
 
-        if self.client is None:
-            self.transfer.setup()
-            self.client = openai.AsyncOpenAI(
-                base_url=self.vllm_endpoint,
-                api_key="EMPTY",
-                max_retries=0,
-            )
-        if self._runner is None:
-            self._runner = asyncio.Runner()
+        self.transfer.setup()
         if self._transfer_executor is None:
             self._transfer_executor = ThreadPoolExecutor(
                 max_workers=self.max_transfer_workers,
                 thread_name_prefix="speculators-hidden-state-transfer",
             )
         self._is_setup = True
+
+    def _recycle_transfer_executor(self) -> None:
+        """Return leaked Mooncake receive buffers to the OS (r8).
+
+        Probes on s96 showed each ``get_into`` can retain one payload-sized
+        anonymous mapping in the engine's native layer. Dropping or closing
+        the engine object does NOT free them (probes M/N); only retiring the
+        executor threads and then creating+closing a fresh event loop does
+        (probes E/O1: -all retained maps). Cheap (thread churn only), safe
+        between batches: no transfer is in flight once get_batch returned.
+        """
+        if self._transfer_executor is not None:
+            self._transfer_executor.shutdown(wait=True)
+            self._transfer_executor = None
+        asyncio.Runner().close()
+        gc.collect()
+        self._transfer_executor = ThreadPoolExecutor(
+            max_workers=self.max_transfer_workers,
+            thread_name_prefix="speculators-hidden-state-transfer",
+        )
+        self._loads_since_recycle = 0
+
+    def _make_client(self) -> openai.AsyncOpenAI:
+        """Create the short-lived client used for a single batch."""
+        return openai.AsyncOpenAI(
+            base_url=self.vllm_endpoint,
+            api_key="EMPTY",
+            max_retries=0,
+        )
 
     def _load_generated(
         self,
@@ -206,20 +234,37 @@ class VllmHiddenStatesSource:
             return []
         if not self._is_setup:
             self._setup()
-        runner = cast("asyncio.Runner", self._runner)
-        return runner.run(self._get_batch_async(records))
+        # r7 (2026-11-06): run each batch on a throwaway client + event loop.
+        # One long-lived loop retains roughly payload-sized native buffers
+        # per run_until_complete call on this build (~1.15 GB per generated
+        # sample per rank), which OOM'd the host at global step 2030 when the
+        # source lived for a whole epoch. Closing the loop after every batch
+        # bounds host RSS. The transfer store and its registered staging
+        # buffers are loop-independent and keep being reused across batches.
+        client = self._make_client()
+        runner = asyncio.Runner()
+        try:
+            result = runner.run(self._get_batch_async(client, records))
+            runner.run(client.close())
+            return result
+        finally:
+            runner.close()
+            self._loads_since_recycle += len(records)
+            if self._loads_since_recycle >= self.executor_recycle_interval:
+                self._recycle_transfer_executor()
 
     async def _get_batch_async(
         self,
+        client: openai.AsyncOpenAI,
         records: Sequence[DatasetRecord],
     ) -> list[HiddenStateResult]:
         """Run one independent worker for each record in the batch."""
-        if self.client is None or self._transfer_executor is None:
+        if self._transfer_executor is None:
             raise RuntimeError("Hidden-state source was not set up")
         tasks = [
             asyncio.create_task(
                 self._worker(
-                    self.client,
+                    client,
                     record,
                     self._transfer_executor,
                 )
@@ -270,22 +315,12 @@ class VllmHiddenStatesSource:
         )
 
     def close(self) -> None:
-        """Close the lazily-created vLLM client, if any."""
-        if (
-            self.client is None
-            and self._runner is None
-            and self._transfer_executor is None
-        ):
-            return
+        """Shut down the shared transfer executor.
 
-        if self._runner is None:
-            self._runner = asyncio.Runner()
-        if self.client is not None:
-            self._runner.run(self.client.close())
+        Clients and event loops are created per batch and closed there (see
+        ``get_batch``); only the executor outlives a batch.
+        """
         if self._transfer_executor is not None:
             self._transfer_executor.shutdown(wait=True, cancel_futures=True)
-        self.client = None
-        self._transfer_executor = None
+            self._transfer_executor = None
         self._is_setup = False
-        self._runner.close()
-        self._runner = None

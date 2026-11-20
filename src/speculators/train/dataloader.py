@@ -193,8 +193,14 @@ def create_train_val_loaders(
     val_loader = _setup_dataloader(
         val_dataset,
         total_seq_len,
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
+        # Val must iterate in-process: a DataLoader worker process would
+        # re-init an NPU device context (hundreds of MB HBM) via
+        # _worker_init_fn at epoch end, when training HBM is at its peak —
+        # this crashed epoch-0 val on Ascend 910b (NPU 507033 / EL0019,
+        # 2026-11-05 03:18). _setup_dataloader branches on use_workers,
+        # so num_workers=0 disables spawn/worker_init_fn/prefetch safely.
+        num_workers=0,
+        prefetch_factor=None,
     )
 
     return train_loader, val_loader
