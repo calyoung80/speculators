@@ -30,6 +30,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [ { name = "Red Hat"} ]
 dependencies = [
+    "numpy",
     "safetensors",
     "torch>=2.6",
 ]
