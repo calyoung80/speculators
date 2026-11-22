@@ -19,7 +19,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.nn.parallel import DistributedDataParallel
 from transformers.modeling_utils import PreTrainedModel
 
-from speculators.train.distributed import get_rank, is_distributed
+from speculators.train.distributed import get_rank
 from speculators.utils.util import get_current_device
 
 logger = logging.getLogger("speculators")
@@ -44,8 +44,7 @@ def _rank0_only(fn):
         result = None
         if get_rank() == 0:
             result = fn(*args, **kwargs)
-        if is_distributed():
-            dist.barrier()
+        # PATCH-1118a: barrier removed - wedge point 1 (4/4 hangs)
         return result
 
     return wrapper
@@ -395,7 +394,7 @@ class DistributedCheckpointer(BaseCheckpointer):
         optimizers = _as_list(optimizer)
         full_state_dict = torch.load(
             self.optimizer_path(self.previous_epoch),
-            mmap=True,
+            mmap=False,  # PATCH-1118c: materialize optimizer state at load
             weights_only=True,
             map_location="cpu",
         )
@@ -443,5 +442,4 @@ class DistributedCheckpointer(BaseCheckpointer):
             patch_config_dtype(self.path / str(epoch) / "config.json", float_dtype)
             torch.save(optimizer_state_dict, self.optimizer_path(epoch))
             self._copy_train_command(epoch)
-
-        dist.barrier()
+        # PATCH-1118b: tail barrier removed - wedge point 2

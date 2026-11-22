@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 import torch
+from hs_connectors.transfer import _load_hs_file
 from safetensors.torch import save_file
 
 from hs_connectors import page_cache_drop, readonly_views
-from hs_connectors.transfer import _load_hs_file
 
 
 def _make_file(path: Path, size: int = 1024) -> Path:

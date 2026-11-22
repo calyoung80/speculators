@@ -257,6 +257,7 @@ async def generate_hidden_states_async(
     client_item: ClientItem,
     *,
     timeout: float | None = DEFAULT_REQUEST_TIMEOUT,  # noqa: ASYNC109
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """
     Runs decode with ``max_tokens=1`` and returns the generation handle together
@@ -267,6 +268,8 @@ async def generate_hidden_states_async(
         model: The model ID.
         client_item: Inputs to send via the client.
         timeout: Timeout in seconds for each request attempt. None for no timeout.
+        extra_headers: Optional extra HTTP headers (e.g. ``X-Batch-Id`` for
+            load-balancer batch-affinity routing).
     """
     token_ids = client_item["input_ids"]
     messages = client_item.get("messages")
@@ -278,6 +281,7 @@ async def generate_hidden_states_async(
             prompt=token_ids,
             max_tokens=1,
             extra_body={"return_token_ids": True},
+            extra_headers=extra_headers,
             timeout=timeout,
         )
     else:
@@ -291,6 +295,7 @@ async def generate_hidden_states_async(
                 "continue_final_message": _continue_final_message_for(model),
                 "return_token_ids": True,
             },
+            extra_headers=extra_headers,
             timeout=timeout,
         )
 

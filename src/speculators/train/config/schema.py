@@ -222,7 +222,30 @@ class DataArgs(_Group):
         "(recommended). float16 is not supported (requires gradient scaling).",
     )
     num_workers: int = Field(default=12, description="Number of dataloader workers.")
-    prefetch_factor: int = Field(default=4, description="Dataloader prefetch factor.")
+    prefetch_factor: int = Field(
+        default=4,
+        description="Dataloader prefetch factor: batches buffered ahead of the "
+        "training loop (torch DataLoader worker slots; for the streaming "
+        "loader it sizes both the outstanding send batches and the "
+        "assembled-batch queue).",
+    )
+    dataloader: Literal["torch", "streaming"] = Field(
+        default="torch",
+        description="Train dataloader implementation. 'torch' pre-packs batches and "
+        "fetches each batch inside DataLoader workers; 'streaming' always uses "
+        "the vLLM source (any on_missing value; there it picks only the "
+        "failure policy) and submits requests as maximal-prefix send batches "
+        "(X-Batch-Id affinity routed) yielded in completion order.",
+    )
+    max_queued_batches: int = Field(
+        default=4,
+        ge=2,
+        description="Pipeline-depth budget (batches) for the streaming "
+        "dataloader: outstanding send batches, the open packer bin, batches "
+        "awaiting fetch, and assembled batches in the yield queue combined. "
+        "Submission stops while occupancy is at the limit, so a stalled "
+        "trainer stops both storage accumulation and idle vLLM compute.",
+    )
     max_transfer_workers: int = Field(
         default=1,
         gt=0,
@@ -270,7 +293,13 @@ class GenerationArgs(_Group):
         default="generate",
         description="Hidden-state source and offline cache-miss policy. 'generate' "
         "selects vLLM generation; 'skip', 'warn', and 'raise' select the offline "
-        "source and control what happens when a cached sample is missing.",
+        "source and control what happens when a cached sample is missing. With "
+        "--dataloader streaming every sample is generated at runtime, so the "
+        "values instead pick the failure policy: 'generate' regenerates a "
+        "failed sample with the same retry budget and consecutive-failure "
+        "circuit breaker as the torch path, "
+        "'skip' and 'warn' degrade the sample with and without a warning, "
+        "'raise' aborts on the first failure.",
     )
     on_generate: Literal["delete"] = Field(
         default="delete",

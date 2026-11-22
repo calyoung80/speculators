@@ -763,6 +763,8 @@ def main(cfg: TrainConfig):  # noqa: C901
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
         seed=args.seed,
+        dataloader=args.dataloader,
+        max_queued_batches=args.max_queued_batches,
     )
 
     # Get trainer kwargs from model class

@@ -5,7 +5,7 @@ import time
 import warnings
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -39,8 +39,12 @@ from speculators.train.optimizers import build_optimizers
 from speculators.train.recovery import BatchRecoveryCoordinator
 from speculators.train.utils import normalize_counted_metrics
 
+if TYPE_CHECKING:
+    from speculators.train.streaming_dataloader import StreamingDataLoader
+
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # silence per-request HTTP logs
 
 
 def _all_reduce_metrics(metrics: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -246,8 +250,8 @@ class Trainer:
         self,
         model: SpeculatorModel,
         config: TrainerConfig,
-        train_loader: DataLoader,
-        val_loader: DataLoader | None = None,
+        train_loader: DataLoader | StreamingDataLoader,
+        val_loader: DataLoader | StreamingDataLoader | None = None,
     ):
         self.model = model
         self.config = config
@@ -273,6 +277,11 @@ class Trainer:
     def _training_state_path(self, epoch: int) -> Path:
         return self.checkpointer.path / str(epoch) / "training_state.json"
 
+    def _loader_state_path(self, epoch: int) -> Path:
+        # Streaming loader state (consumed-record bitmap) is per-rank, so each
+        # rank snapshots its own file next to the rank-0 training state.
+        return self.checkpointer.path / str(epoch) / f"loader_state_rank{self.rank}.json"
+
     def _save_training_state(self, epoch: int, local_step: int) -> None:
         if not self.is_distributed or dist.get_rank() == 0:
             state = {
@@ -283,6 +292,23 @@ class Trainer:
             p = self._training_state_path(epoch)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(state))
+        loader_state = getattr(self.train_loader, "state_dict", None)
+        if callable(loader_state):
+            p = self._loader_state_path(epoch)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(loader_state()))
+
+    def _load_loader_state(self) -> dict:
+        epoch = self.checkpointer.previous_epoch
+        p = self._loader_state_path(epoch)
+        if p.exists():
+            try:
+                return json.loads(p.read_text())
+            except json.JSONDecodeError as e:
+                root_logger.warning(f"Failed to decode loader state {p}: {e}")
+            except (FileNotFoundError, PermissionError, OSError) as e:
+                root_logger.warning(f"Failed to read loader state {p}: {e}")
+        return {}
 
     def _load_training_state(self) -> dict:
         epoch = self.checkpointer.previous_epoch
@@ -327,6 +353,22 @@ class Trainer:
                     root_logger.info(
                         f"Resuming training on epoch {self.current_epoch}."
                     )
+                # Streaming loader resume: restore the per-rank consumed-record
+                # bitmap (no-op for torch loaders, which have no state_dict).
+                # A mid-epoch bitmap prunes already-trained records; an
+                # end-of-epoch one is cleared by the next set_epoch anyway.
+                load_loader_state = getattr(
+                    self.train_loader, "load_state_dict", None
+                )
+                if callable(load_loader_state):
+                    loader_state = self._load_loader_state()
+                    if loader_state:
+                        load_loader_state(loader_state)
+                        root_logger.info(
+                            "Restored streaming loader state: "
+                            f"{len(loader_state.get('consumed', ()))} records "
+                            "marked consumed."
+                        )
             else:
                 root_logger.warning(
                     "`resume_from_checkpoint` is False, starting "
@@ -552,6 +594,15 @@ class Trainer:
                 f"(no vLLM calls for skipped batches). "
                 f"epoch={epoch}, global_step={self.global_step}."
             )
+        elif skip_steps > 0 and hasattr(self.train_loader, "load_state_dict"):
+            # Streaming loader: the restored consumed-record bitmap already
+            # prunes trained records, so there is nothing to step-replay; the
+            # remaining batches are exactly the untrained ones.
+            root_logger.info(
+                "Streaming loader resume: consumed-record bitmap already "
+                "skips trained records; not replaying steps."
+            )
+            skip_steps = 0
         elif skip_steps > 0:
             root_logger.warning(
                 "Sampler lacks fast-skip API; resume will replay "

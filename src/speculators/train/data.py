@@ -191,6 +191,20 @@ class SpeculatorsDataset(Dataset):
         """Fetch and collate a DataLoader batch into its final representation."""
         records = self.records.__getitems__(indices)
         loaded_hs = self.hidden_states.get_batch(records)
+        return self.collate_loaded(indices, records, loaded_hs)
+
+    def collate_loaded(
+        self,
+        indices: list[int],
+        records: Sequence[DatasetRecord],
+        loaded_hs: Sequence[HiddenStateSample | SampleUnavailable],
+    ) -> BatchType:
+        """Collate pre-loaded hidden states into the final batch.
+
+        Shared by ``__getitems__`` (torch path) and the streaming loader, which
+        supplies payloads it fetched itself; entries may be
+        ``SampleUnavailable`` and are skipped like cache misses.
+        """
         samples = [
             self._build_sample(index, record, hidden_states)
             for index, record, hidden_states in zip(

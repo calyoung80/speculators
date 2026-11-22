@@ -15,6 +15,7 @@ import torch
 from safetensors.torch import load_file
 
 from hs_connectors.fp8_utils import SCALES_KEY, dequantize_fp8_tensor
+from hs_connectors.http_store import HttpStore, HttpStoreConfig
 from hs_connectors.mooncake_store import MooncakeHiddenStatesStore, MooncakeStoreConfig
 from hs_connectors.mooncake_te_store import MooncakeTEConfig, MooncakeTEStore
 
@@ -395,7 +396,7 @@ class MooncakeBackend(HiddenStatesBackend):
         _add_argument_if_absent(
             parser,
             "--mooncake-protocol",
-            choices=["tcp", "rdma"],
+            choices=["tcp", "rdma", "ascend"],
             default="tcp",
             help="Mooncake transport protocol. Used with backend=mooncake.",
         )
@@ -591,5 +592,123 @@ class MooncakeTEBackend(HiddenStatesBackend):
             "kv_connector_module_path": "hs_connectors.mooncake_te_connector",
             "kv_connector_extra_config": {
                 "mooncake_te": dataclasses.asdict(te_cfg),
+            },
+        }
+
+
+# ---------------------------------------------------------------------------
+# HTTP backend (plain HTTP key-value server; no fabric memory required)
+# ---------------------------------------------------------------------------
+
+
+class HttpTransfer(HiddenStatesTransfer):
+    """HTTP key-value store based hidden-states transfer.
+
+    The trainer GETs packed tensor bytes from an HTTP server that the
+    vLLM-side ``HttpHiddenStatesConnector`` PUTs to. Useful on Ascend
+    nodes where the mooncake adxl engine cannot allocate fabric memory
+    inside vLLM workers.
+    """
+
+    def __init__(self, store: HttpStore):
+        self.store = store
+
+    def setup(self) -> None:
+        if not self.store.is_setup:
+            self.store.setup()
+
+    def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:  # noqa: ARG002
+        return None
+
+    def get_generated(
+        self, hs_transfer_params: dict[str, Any]
+    ) -> dict[str, torch.Tensor] | None:
+        return self.store.get_sample(hs_transfer_params)
+
+    def delete(self, handle: str) -> None:
+        self.store.delete_sample(handle)
+
+
+@HiddenStatesBackend.register("http")
+class HttpBackend(HiddenStatesBackend):
+    """HTTP key-value store backend (no mooncake, no fabric memory).
+
+    Requires a running HTTP key-value server (see
+    ``scripts/hs_http_server.py``) reachable at ``--http-endpoint``.
+    """
+
+    @staticmethod
+    def _add_http_args(parser: argparse.ArgumentParser) -> None:
+        _add_argument_if_absent(
+            parser,
+            "--http-endpoint",
+            type=str,
+            default="http://127.0.0.1:9020",
+            help=(
+                "Base URL of the HTTP hidden-states key-value server "
+                "(e.g. http://10.100.1.67:50088). Used with backend=http."
+            ),
+        )
+        _add_argument_if_absent(
+            parser,
+            "--http-connection-pool-size",
+            type=int,
+            default=8,
+            help="Keep-alive connection pool size per HttpStore (default 8).",
+        )
+        _add_argument_if_absent(
+            parser,
+            "--http-max-chunk-mib",
+            type=float,
+            default=512.0,
+            help="Payloads above this (MiB) are split into chunks of this size and transferred in parallel (default 512).",
+        )
+
+    @staticmethod
+    def add_train_args(parser: argparse.ArgumentParser) -> None:
+        HttpBackend._add_http_args(parser)
+
+    @staticmethod
+    def add_launch_args(parser: argparse.ArgumentParser) -> None:
+        HttpBackend._add_http_args(parser)
+        _add_argument_if_absent(
+            parser,
+            "--http-writer-threads",
+            type=int,
+            default=4,
+            help="Number of asynchronous HTTP writer threads in the vLLM client.",
+        )
+
+    @staticmethod
+    def _store_config_from_args(args: argparse.Namespace) -> HttpStoreConfig:
+        return HttpStoreConfig(
+            endpoint=args.http_endpoint,
+            max_connections=args.http_connection_pool_size,
+            chunk_size_bytes=int(args.http_max_chunk_mib * 1024**2),
+        )
+
+    @staticmethod
+    def from_train_args(
+        args: argparse.Namespace,
+        data_path: str,  # noqa: ARG004
+    ) -> HttpTransfer:
+        store = HttpStore(HttpBackend._store_config_from_args(args))
+        return HttpTransfer(store)
+
+    @staticmethod
+    def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:
+        http_cfg = HttpBackend._store_config_from_args(args)
+
+        return {
+            "kv_connector": "HttpHiddenStatesConnector",
+            "kv_role": "kv_producer",
+            "kv_connector_module_path": (
+                "hs_connectors.http_hidden_states_connector"
+            ),
+            "kv_connector_extra_config": {
+                "http": {
+                    **http_cfg.to_dict(),
+                    "num_writer_threads": args.http_writer_threads,
+                },
             },
         }

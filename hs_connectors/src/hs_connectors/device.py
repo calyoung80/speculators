@@ -10,6 +10,7 @@ it to the ``torch`` module exposing the CUDA-like stream API.
 from __future__ import annotations
 
 import contextlib
+import threading
 import os
 from typing import Any
 
@@ -62,3 +63,36 @@ def ensure_accelerator_context() -> None:
         torch.zeros(1, device=accelerator)
 
     _initialized_pid = pid
+
+
+_thread_ctx = threading.local()
+
+
+def ensure_thread_context(device_index: "int | None" = None) -> None:
+    """Bind an NPU context in the calling thread (thread-local guard).
+
+    CANN contexts are thread-local; mooncake's adxl engine executes fabric
+    transfers in the calling thread, so pool threads that call the store
+    must each hold a context. Unlike ensure_accelerator_context
+    (PID-guarded for forked workers), this guard is thread-local and safe
+    to call from ThreadPoolExecutor initializers.
+
+    device_index pins the thread to a specific device; when omitted the
+    thread's current device is used. Callers that know the rank's device
+    should pass it explicitly because fresh threads may default to 0.
+    """
+    if getattr(_thread_ctx, "initialized", False):
+        return
+    accelerator = torch.accelerator.current_accelerator()
+    if accelerator is None or not torch.accelerator.is_available():
+        return
+    with contextlib.suppress(Exception):
+        if device_index is not None:
+            torch.accelerator.set_device_index(device_index)
+        else:
+            torch.accelerator.set_device_index(
+                torch.accelerator.current_device_index()
+            )
+    with contextlib.suppress(Exception):
+        torch.zeros(1, device=accelerator)
+    _thread_ctx.initialized = True

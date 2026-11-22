@@ -21,10 +21,24 @@ class DatasetRecord:
     def from_arrow_row(
         cls, row: Mapping[str, Any], *, storage_index: int
     ) -> "DatasetRecord":
-        """Create a record from one formatted Arrow/Hugging Face row."""
+        """Create a record from one formatted Arrow/Hugging Face row.
+
+        HF ``datasets`` returns plain Python lists for List() columns (the
+        producer's stack returned tensor-like rows), while downstream
+        consumers (``build_client_item``, ``check_hidden_states``, packing)
+        call ``.tolist()`` / ``torch.equal`` on these fields. Coerce to the
+        dtypes the collate path uses (long / bool) so both list- and
+        tensor-shaped rows work.
+        """
+        input_ids = row["input_ids"]
+        loss_mask = row["loss_mask"]
         return cls(
-            input_ids=row["input_ids"],
-            loss_mask=row["loss_mask"],
+            input_ids=input_ids
+            if isinstance(input_ids, torch.Tensor)
+            else torch.tensor(input_ids, dtype=torch.long),
+            loss_mask=loss_mask
+            if isinstance(loss_mask, torch.Tensor)
+            else torch.tensor(loss_mask, dtype=torch.bool),
             seq_len=int(row["seq_len"]),
             storage_index=storage_index,
             messages=row.get("messages"),

@@ -1,8 +1,10 @@
 """Hidden-state acquisition for training data."""
 
 import asyncio
+import contextlib
 import gc
 import logging
+import uuid
 import warnings
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +12,7 @@ from typing import Any, Literal, Protocol, cast
 
 import openai
 import torch
+from hs_connectors.device import ensure_thread_context
 
 from hs_connectors import HiddenStatesTransfer
 from speculators.data_generation.offline import check_hidden_states
@@ -138,22 +141,59 @@ class VllmHiddenStatesSource:
         # every executor_recycle_interval loaded samples.
         self._loads_since_recycle = 0
         self.executor_recycle_interval = 4
+        # Streaming-path client (mooncake-integration): the streaming loader
+        # drives generate()/load_generated() on its own long-lived event loop
+        # and fetch threads, so it needs a persistent client here. The torch
+        # path (get_batch) keeps its r7 per-batch throwaway clients and never
+        # touches this attribute.
+        self._client: openai.AsyncOpenAI | None = None
+        # NPU device index captured at setup time; pool threads bind this
+        # context via ensure_thread_context (CANN contexts are thread-local
+        # and mooncake's adxl engine runs fabric transfers on the calling
+        # thread; fresh threads otherwise default to device 0).
+        self._device_index: int | None = None
         self.generation_recovery = GenerationRecoveryGuard(
             retries=generation_validation_retries,
             max_consecutive_failures=max_consecutive_generation_failures,
         )
+
+    def __getstate__(self):
+        # AsyncOpenAI client and ThreadPoolExecutor are process-local;
+        # DataLoader workers recreate them via lazy _setup().
+        state = self.__dict__.copy()
+        state["_client"] = None
+        state["_transfer_executor"] = None
+        state["_is_setup"] = False
+        state["_loads_since_recycle"] = 0
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._client = None
+        self._transfer_executor = None
+        self._is_setup = False
+        self._loads_since_recycle = 0
 
     def _setup(self) -> None:
         if self._is_setup:
             return
 
         self.transfer.setup()
+        if self._device_index is None:
+            with contextlib.suppress(Exception):  # CPU-only hosts
+                if torch.accelerator.is_available():
+                    self._device_index = torch.accelerator.current_device_index()
         if self._transfer_executor is None:
             self._transfer_executor = ThreadPoolExecutor(
                 max_workers=self.max_transfer_workers,
                 thread_name_prefix="speculators-hidden-state-transfer",
+                initializer=lambda: ensure_thread_context(self._device_index),
             )
         self._is_setup = True
+
+    def setup(self) -> None:
+        """Public setup so non-DataLoader consumers can prime the client."""
+        self._setup()
 
     def _recycle_transfer_executor(self) -> None:
         """Return leaked Mooncake receive buffers to the OS (r8).
@@ -164,6 +204,8 @@ class VllmHiddenStatesSource:
         executor threads and then creating+closing a fresh event loop does
         (probes E/O1: -all retained maps). Cheap (thread churn only), safe
         between batches: no transfer is in flight once get_batch returned.
+        Recreated threads re-bind the NPU context via the initializer
+        (mooncake-integration: CANN contexts are thread-local).
         """
         if self._transfer_executor is not None:
             self._transfer_executor.shutdown(wait=True)
@@ -173,6 +215,7 @@ class VllmHiddenStatesSource:
         self._transfer_executor = ThreadPoolExecutor(
             max_workers=self.max_transfer_workers,
             thread_name_prefix="speculators-hidden-state-transfer",
+            initializer=lambda: ensure_thread_context(self._device_index),
         )
         self._loads_since_recycle = 0
 
@@ -184,7 +227,33 @@ class VllmHiddenStatesSource:
             max_retries=0,
         )
 
-    def _load_generated(
+    async def generate(
+        self,
+        record: DatasetRecord,
+        extra_headers: dict[str, str] | None = None,
+    ) -> GenerationReceipt:
+        """Send one request and return its receipt without fetching the payload.
+
+        Used by the streaming loader, which decouples request submission from
+        batch assembly; ``load_generated`` completes the round trip. Runs on
+        the caller's event loop with the persistent client created in
+        ``_setup`` (the streaming loader owns one long-lived loop; the torch
+        path never uses this method).
+        """
+        self._setup()
+        if self._client is None:  # pragma: no cover - defensive
+            self._client = self._make_client()
+        handle, transfer_params = await generate_hidden_states_async(
+            self._client,
+            self.model,
+            build_client_item(record),
+            timeout=self.request_timeout,
+            max_retries=self.max_retries,
+            extra_headers=extra_headers,
+        )
+        return GenerationReceipt(handle, transfer_params)
+
+    def load_generated(
         self,
         record: DatasetRecord,
         receipt: GenerationReceipt,
@@ -258,15 +327,23 @@ class VllmHiddenStatesSource:
         client: openai.AsyncOpenAI,
         records: Sequence[DatasetRecord],
     ) -> list[HiddenStateResult]:
-        """Run one independent worker for each record in the batch."""
+        """Run one independent worker for each record in the batch.
+
+        All requests of one batch share an ``X-Batch-Id`` header so a
+        batch-affinity load balancer can pin them to the same vLLM instance
+        (the pack budget matches vLLM's ``max_num_batched_tokens``, letting
+        the scheduler co-batch them into a single engine step).
+        """
         if self._transfer_executor is None:
             raise RuntimeError("Hidden-state source was not set up")
+        batch_headers = {"X-Batch-Id": uuid.uuid4().hex}
         tasks = [
             asyncio.create_task(
                 self._worker(
                     client,
                     record,
                     self._transfer_executor,
+                    batch_headers,
                 )
             )
             for record in records
@@ -289,6 +366,7 @@ class VllmHiddenStatesSource:
         client: openai.AsyncOpenAI,
         record: DatasetRecord,
         transfer_executor: ThreadPoolExecutor,
+        batch_headers: dict[str, str] | None = None,
     ) -> HiddenStateResult:
         """Generate, transfer, and validate one sample with recovery."""
         description = (
@@ -302,9 +380,10 @@ class VllmHiddenStatesSource:
                 build_client_item(record),
                 timeout=self.request_timeout,
                 max_retries=self.max_retries,
+                extra_headers=batch_headers,
             )
             receipt = GenerationReceipt(handle, transfer_params)
-            future = transfer_executor.submit(self._load_generated, record, receipt)
+            future = transfer_executor.submit(self.load_generated, record, receipt)
             while not future.done():  # noqa: ASYNC110 - keep request tasks running
                 await asyncio.sleep(0.001)
             return future.result()
@@ -315,11 +394,20 @@ class VllmHiddenStatesSource:
         )
 
     def close(self) -> None:
-        """Shut down the shared transfer executor.
+        """Shut down the shared transfer executor and streaming client.
 
-        Clients and event loops are created per batch and closed there (see
-        ``get_batch``); only the executor outlives a batch.
+        Torch-path clients and event loops are created per batch and closed
+        there (see ``get_batch``); the streaming client and the executor
+        outlive a batch and are released here.
         """
+        if self._client is not None:
+            runner = asyncio.Runner()
+            try:
+                with contextlib.suppress(Exception):  # best-effort close
+                    runner.run(self._client.close())
+            finally:
+                runner.close()
+            self._client = None
         if self._transfer_executor is not None:
             self._transfer_executor.shutdown(wait=True, cancel_futures=True)
             self._transfer_executor = None

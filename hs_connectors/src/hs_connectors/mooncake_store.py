@@ -9,6 +9,7 @@ response so the two sides can run on different nodes.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import threading
@@ -17,6 +18,7 @@ from dataclasses import dataclass
 from math import prod
 from typing import Any
 
+import numpy as np
 import torch
 
 from hs_connectors.device import ensure_accelerator_context
@@ -27,7 +29,6 @@ logger = logging.getLogger(__name__)
 VERSION = 1
 
 _TENSOR_ALIGN = 64
-_STAGING_GRANULE = 64 << 20
 _OBJECT_NOT_FOUND = -704
 _MIN_POLL_INTERVAL = 0.001
 
@@ -102,13 +103,10 @@ def _parse_dtype(key: str, name: str, value: Any) -> torch.dtype:
     return dtype
 
 
-def _empty_host(nbytes: int, pin: bool) -> torch.Tensor:
-    if pin:
-        try:
-            return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-        except Exception:  # noqa: BLE001 - accelerator without pinned memory
-            logger.warning("Pinned host memory unavailable; using pageable memory")
-    return torch.empty(nbytes, dtype=torch.uint8)
+def _lease_tensor(lease: Any, nbytes: int) -> torch.Tensor:
+    """Wrap a staging lease as a writable CPU ``torch.uint8`` view."""
+    buf = (ctypes.c_ubyte * nbytes).from_address(int(lease.ptr))
+    return torch.from_numpy(np.ctypeslib.as_array(buf))
 
 
 @dataclass
@@ -140,16 +138,30 @@ class MooncakeHiddenStatesStore:
     Each sample is one raw object containing 64-byte-aligned tensor bytes. The
     versioned transfer manifest is supplied separately and describes the layout
     of those bytes. A Mooncake put becomes visible atomically, so the object's
-    presence marks the sample complete. Per-thread staging buffers are
-    registered with Mooncake once, allowing ``put_from``/``get_into`` to use
-    those buffers directly without an additional Mooncake client-side bounce
-    buffer.
+    presence marks the sample complete. Staging leases are sub-allocated from
+    the store's registered client buffer, so ``put_from``/``get_into`` use them
+    directly without a client-side bounce copy.
     """
 
     def __init__(self, config: MooncakeStoreConfig):
         self.config = config
         self._store = None
-        self._staging: dict[tuple[int, str], torch.Tensor] = {}
+        self._pool = None
+        self._pool_lock = threading.Lock()
+
+    def __getstate__(self):
+        # BufferPool, locks, and the C++ store are process-local;
+        # DataLoader workers recreate them via lazy setup().
+        state = self.__dict__.copy()
+        state["_pool"] = None
+        state["_pool_lock"] = None
+        state["_store"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._pool = None
+        self._pool_lock = threading.Lock()
 
     @property
     def is_setup(self):
@@ -203,27 +215,19 @@ class MooncakeHiddenStatesStore:
             raise RuntimeError("call setup() first")
         return self._store
 
-    def _staging_buffer(self, role: str, nbytes: int) -> torch.Tensor:
-        """This thread's registered buffer for ``role``, grown to ``nbytes``."""
-        store = self._require_store()
-        slot = (threading.get_ident(), role)
-        buffer = self._staging.get(slot)
-        if buffer is not None and buffer.numel() >= nbytes:
-            return buffer
-        if buffer is not None:
-            del self._staging[slot]
-            result = store.unregister_buffer(buffer.data_ptr())
-            if result != 0:
-                logger.warning("Mooncake unregister_buffer returned %s", result)
-        capacity = -(-max(nbytes, 1) // _STAGING_GRANULE) * _STAGING_GRANULE
-        buffer = _empty_host(capacity, pin=role == "put")
-        _check_store_result(
-            "register_buffer",
-            f"<{role} staging>",
-            store.register_buffer(buffer.data_ptr(), capacity),
-        )
-        self._staging[slot] = buffer
-        return buffer
+    def _staging_pool(self):
+        """Lazily create the BufferPool over the store's registered client buffer."""
+        if self._pool is None:
+            with self._pool_lock:
+                if self._pool is None:
+                    from mooncake.store import (  # type: ignore[import-not-found] # noqa: PLC0415
+                        BufferPool,
+                    )
+
+                    self._pool = BufferPool(
+                        self._require_store(), max_bytes=self.config.local_buffer_size
+                    )
+        return self._pool
 
     def put_sample(
         self, transfer_manifest: dict[str, Any], tensors: dict[str, torch.Tensor]
@@ -231,10 +235,8 @@ class MooncakeHiddenStatesStore:
         """Publish ``tensors``, which may live on the accelerator.
 
         The transfer manifest supplies the packed byte layout shared with the
-        consumer.
-
-        Device tensors are copied into the pinned staging buffer on the current
-        stream, so callers can pick the stream the DtoH copy runs on.
+        consumer. Device tensors are copied into a staging lease on the current
+        stream, then published zero-copy via ``put_from``.
         """
         tensor_spec = transfer_manifest["tensors"]
         total_bytes = transfer_manifest["metadata"]["total_aligned_bytes"]
@@ -249,23 +251,37 @@ class MooncakeHiddenStatesStore:
 
         for name, spec in tensor_spec.items():
             tensor = tensors[name]
-            expected_shape = tuple(spec["shape"])
-            if tuple(tensor.shape) != expected_shape:
-                raise MooncakeIntegrityError(
-                    f"Producer tensor {name!r} shape {tuple(tensor.shape)} does not "
-                    f"match manifest shape {expected_shape}"
-                )
-
             expected_dtype = _parse_dtype(
                 transfer_manifest["handle"], name, spec["dtype"]
             )
-            if tensor.dtype != expected_dtype:
-                raise MooncakeIntegrityError(
-                    f"Producer tensor {name!r} dtype {tensor.dtype} does not "
-                    f"match manifest dtype {expected_dtype}"
+            if isinstance(tensor, list):
+                # Chunked device tensor (payload-size fix): gathered in token
+                # slices by the connector; validated by total byte size.
+                if not tensor:
+                    raise MooncakeIntegrityError(
+                        f"Producer tensor {name!r} chunk list is empty"
+                    )
+                if tensor[0].dtype != expected_dtype:
+                    raise MooncakeIntegrityError(
+                        f"Producer tensor {name!r} dtype {tensor[0].dtype} does not "
+                        f"match manifest dtype {expected_dtype}"
+                    )
+                actual_nbytes = sum(
+                    c.numel() * c.element_size() for c in tensor
                 )
-
-            actual_nbytes = tensor.numel() * tensor.element_size()
+            else:
+                expected_shape = tuple(spec["shape"])
+                if tuple(tensor.shape) != expected_shape:
+                    raise MooncakeIntegrityError(
+                        f"Producer tensor {name!r} shape {tuple(tensor.shape)} does not "
+                        f"match manifest shape {expected_shape}"
+                    )
+                if tensor.dtype != expected_dtype:
+                    raise MooncakeIntegrityError(
+                        f"Producer tensor {name!r} dtype {tensor.dtype} does not "
+                        f"match manifest dtype {expected_dtype}"
+                    )
+                actual_nbytes = tensor.numel() * tensor.element_size()
             if actual_nbytes != spec["nbytes"]:
                 raise MooncakeIntegrityError(
                     f"Producer tensor {name!r} has {actual_nbytes} bytes, but the "
@@ -273,16 +289,41 @@ class MooncakeHiddenStatesStore:
                 )
 
         store = self._require_store()
-        staging = self._staging_buffer("put", total_bytes)
+        # Lease memory lives in the registered client buffer, so put_from needs
+        # no register_buffer (caller memory fails with -600 on Ascend fabric).
+        lease = self._staging_pool().acquire(total_bytes)
+        try:
+            staging = _lease_tensor(lease, total_bytes)
 
-        for name, spec in tensor_spec.items():
-            tensor = tensors[name]
-            region = staging[spec["offset"] : spec["offset"] + spec["nbytes"]]
-            region.view(tensor.dtype).view(tensor.shape).copy_(tensor)
+            for name, spec in tensor_spec.items():
+                tensor = tensors[name]
+                region = staging[spec["offset"] : spec["offset"] + spec["nbytes"]]
+                if isinstance(tensor, list):
+                    # Copy each chunk into its slice of the packed region so every
+                    # DtoH stays small (a single ~2.4 GB pinned copy hangs AICPU).
+                    off = 0
+                    step = 8 * 1024 * 1024  # 8M elements, node82-proven DtoH slice
+                    for chunk in tensor:
+                        n = chunk.numel() * chunk.element_size()
+                        dst = region[off : off + n].view(chunk.dtype).reshape(-1)
+                        src_flat = chunk.reshape(-1)
+                        for s_ in range(0, src_flat.numel(), step):
+                            e = min(s_ + step, src_flat.numel())
+                            dst[s_:e].copy_(src_flat[s_:e])
+                        off += n
+                    if off != spec["nbytes"]:
+                        raise MooncakeIntegrityError(
+                            f"Producer tensor {name!r} chunks covered {off} bytes, "
+                            f"but the manifest reserves {spec['nbytes']}"
+                        )
+                else:
+                    region.view(tensor.dtype).view(tensor.shape).copy_(tensor)
 
-        handle = transfer_manifest["handle"]
-        result = store.put_from(handle, staging.data_ptr(), total_bytes)
-        _check_store_result("put_from", handle, result)
+            handle = transfer_manifest["handle"]
+            result = store.put_from(handle, lease.ptr, total_bytes)
+            _check_store_result("put_from", handle, result)
+        finally:
+            lease.release()
 
     def put_error(self, transfer_manifest: dict[str, Any], error: str) -> None:
         """Publish a small terminal marker so consumers fail fast and can retry."""
@@ -334,15 +375,21 @@ class MooncakeHiddenStatesStore:
         handle = transfer_manifest["handle"]
         tensor_specs = transfer_manifest["tensors"]
         expected_payload_size = transfer_manifest["metadata"]["total_aligned_bytes"]
-        staging_tensor = self._read_from_store(handle, expected_payload_size)
+        staging_tensor, lease = self._read_from_store(handle, expected_payload_size)
 
-        return {
-            name: self._extract_tensor(handle, name, staging_tensor, spec)
-            for name, spec in tensor_specs.items()
-        }
+        try:
+            return {
+                name: self._extract_tensor(handle, name, staging_tensor, spec)
+                for name, spec in tensor_specs.items()
+            }
+        finally:
+            lease.release()
 
     def _read_from_store(self, key, expected_payload_size: int = 0):
-        """Read one raw Mooncake object into the registered get buffer."""
+        """Read one raw Mooncake object into a staging lease via ``get_into``.
+
+        Returns ``(tensor, lease)``; the view is invalid after ``lease.release()``.
+        """
         store = self._require_store()
         size = store.get_size(key)
         if not isinstance(size, int) or size < 0:
@@ -355,21 +402,27 @@ class MooncakeHiddenStatesStore:
                 f"size {expected_payload_size}"
             )
 
-        staging = self._staging_buffer("get", size)
-        received = store.get_into(key, staging.data_ptr(), size)
-        if received != size:
-            raise MooncakeIntegrityError(
-                f"Mooncake get_into for key={key} returned {received}, "
-                f"expected {size} bytes"
-            )
-
-        return staging[:size]
+        lease = self._staging_pool().acquire(size)
+        try:
+            received = store.get_into(key, lease.ptr, size)
+            if received != size:
+                raise MooncakeIntegrityError(
+                    f"Mooncake get_into for key={key} returned {received}, "
+                    f"expected {size} bytes"
+                )
+            return _lease_tensor(lease, size), lease
+        except BaseException:
+            lease.release()
+            raise
 
     def _process_error(self, error_handle, transfer_manifest: dict[str, Any]):
         """Read a producer error marker and raise it as an integrity error."""
-        obj = self._read_from_store(error_handle)
+        obj, lease = self._read_from_store(error_handle)
+        try:
+            raw = obj.numpy().tobytes()
+        finally:
+            lease.release()
 
-        raw = obj.numpy().tobytes()
         try:
             error_dict = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -393,7 +446,7 @@ class MooncakeHiddenStatesStore:
     def _extract_tensor(
         key: str, name: str, obj: torch.Tensor, spec: Any
     ) -> torch.Tensor:
-        """Copy one tensor out of the staging buffer, which the next get reuses."""
+        """Copy one tensor out of the staging lease before it is released."""
         try:
             shape = tuple(int(d) for d in spec["shape"])
             dtype = _parse_dtype(key, name, spec["dtype"])

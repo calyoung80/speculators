@@ -48,6 +48,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# Chunking activates for sequences > 8192 tokens; at or below that the
+# original single-op path runs unchanged. Each gather slice is 8192 tokens
+# (8192 * 6 * 6144 * 2B ~= 600 MB), inside the proven-safe envelope.
+_HS_GATHER_CHUNK_THRESHOLD = 8192
+_HS_GATHER_CHUNK_TOKENS = 8192
+
+
 def sanitize_key(key: str) -> str:
     """Make a request id safe to use as a Mooncake key."""
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", key)
@@ -290,17 +297,28 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         try:
             with self._device().stream(copy_stream):
                 slot_mapping = slot_mapping.to(self._kv_cache.device, non_blocking=True)
+                # Flat-index gather (PR 20261113): the three-subscript
+                # AiCPU fallback is eliminated, so one gather serves any
+                # request size. Slicing below only bounds the DtoH chunks
+                # handed to the store (8M-element sub-copies).
                 hidden_states = extract_from_kv_cache(
                     self._kv_cache,
                     slot_mapping,
                     num_tokens,
                 )
                 assert_finite("hidden_states", hidden_states)
-                # The DtoH copy into the store's registered staging buffer runs
-                # on the copy stream and completes before the put.
+                if num_tokens <= _HS_GATHER_CHUNK_THRESHOLD:
+                    payload = hidden_states
+                else:
+                    payload = [
+                        hidden_states[
+                            s : min(s + _HS_GATHER_CHUNK_TOKENS, num_tokens)
+                        ]
+                        for s in range(0, num_tokens, _HS_GATHER_CHUNK_TOKENS)
+                    ]
                 self._store.put_sample(
                     pending.transfer_manifest,
-                    {"hidden_states": hidden_states, "token_ids": pending.token_ids},
+                    {"hidden_states": payload, "token_ids": pending.token_ids},
                 )
         except Exception as exc:
             try:
