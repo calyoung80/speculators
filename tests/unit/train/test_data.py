@@ -499,6 +499,21 @@ def test_vllm_hidden_states_source_close_is_idempotent():
     assert source._transfer_executor is None
 
 
+def test_vllm_hidden_states_source_public_setup_primes_client():
+    source = source_module.VllmHiddenStatesSource(
+        transfer=_SequenceTransfer([]),  # type: ignore[arg-type]
+        model="model",
+    )
+    client = _QueuedAsyncOpenAI([])
+    _use_client(source, client)
+
+    source.setup()
+
+    assert source._client is client
+    source.close()
+    assert client.close_calls == 1
+
+
 def test_arrow_dataset_retries_nonfinite_read_then_recovers(tmp_path, caplog):
     corrupt = _valid_generated_sample()
     corrupt["hidden_states"][1, 0, 0] = float("nan")

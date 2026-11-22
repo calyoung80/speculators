@@ -192,8 +192,15 @@ class VllmHiddenStatesSource:
         self._is_setup = True
 
     def setup(self) -> None:
-        """Public setup so non-DataLoader consumers can prime the client."""
+        """Public setup for non-DataLoader consumers (streaming loader).
+
+        Primes the persistent client on the caller's thread: the streaming
+        loader calls this from its main thread before starting the pipeline
+        event loop, so the client is created under the trackable context.
+        """
         self._setup()
+        if self._client is None:
+            self._client = self._make_client()
 
     def _recycle_transfer_executor(self) -> None:
         """Return leaked Mooncake receive buffers to the OS (r8).
