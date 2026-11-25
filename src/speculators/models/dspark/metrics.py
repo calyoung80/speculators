@@ -42,15 +42,34 @@ def _masked_decayed_mean(
     pos_idx: torch.Tensor,  # [1, T]
     decay_fn: Callable[..., torch.Tensor] | None,
 ) -> torch.Tensor:
-    """Masked, optionally position-decayed mean of a precomputed per-position term."""
-    loss_mask = loss_mask.to(elementwise.dtype)
-    weighted = elementwise * loss_mask
+    """Masked, optionally position-decayed mean of a precomputed per-position term.
+
+    Under sequence parallelism the numerator and the raw token count are summed
+    across the SP group *before* ``_EPS`` is added; adding it per rank would make
+    the global denominator ``sp_size * _EPS`` too large.
+    """
+    loss_mask_f = loss_mask.to(elementwise.dtype)
+    weighted = elementwise * loss_mask_f
     if decay_fn is not None:
         weighted = weighted * decay_fn(
             pos_idx.to(weighted.dtype), elementwise_loss=elementwise
         )
-    denominator = loss_mask.sum(dim=1) + _EPS
-    return (weighted.sum(dim=1) / denominator).mean()
+    numerator = weighted.sum(dim=1)
+    denominator = loss_mask_f.sum(dim=1)
+    if _sp_size() > 1:
+        from speculators.train.sequence_parallel import sp_ratio_reduce
+
+        numerator, denominator = sp_ratio_reduce(numerator, denominator)
+    return (numerator / (denominator + _EPS)).mean()
+
+
+def _sp_size() -> int:
+    """Sequence-parallel degree, or 1 when the training package is unavailable."""
+    try:
+        from speculators.train.distributed import get_sp_size
+    except Exception:  # pragma: no cover - train extras not installed
+        return 1
+    return get_sp_size()
 
 
 def compute_metrics(

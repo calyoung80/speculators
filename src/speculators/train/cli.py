@@ -3,6 +3,7 @@
 import argparse
 import gc
 import logging
+import os
 import random
 import warnings
 from copy import deepcopy
@@ -39,6 +40,7 @@ from speculators.train.logger import (
     setup_metric_logger,
     setup_root_logger,
 )
+from speculators.train.released_draft import build_draft_from_released
 from speculators.train.trainer import Trainer, TrainerConfig
 from speculators.train.utils import resolve_mask_token_id
 from speculators.train.vocab_mapping import (
@@ -54,6 +56,76 @@ DRAFT_ARCH_CONFIGS: dict[str, type] = {
     "qwen3": Qwen3Config,
 }
 MROPE_INVERSE_TOLERANCE = 1e-6
+
+# Draft models whose attention path was ported to sequence parallelism.  Anything
+# else must fail closed instead of silently training with wrong gradients.
+SP_SUPPORTED_SPECULATORS = frozenset({"dflash", "dspark", "dflash2"})
+
+
+def _validate_sp_config(
+    *,
+    world_size: int,
+    sp_size: int,
+    speculator_type: str,
+    total_seq_len: int | None,
+    max_anchors: int | None,
+    num_attention_heads: int | None,
+    distributed: bool,
+    fsdp_shard: bool = False,
+) -> None:
+    """Fail-closed validation of the sequence-parallel topology.
+
+    Pure function (no global state, no process-group init) so unit tests can feed
+    it an arbitrary parameter matrix.  Raises ``ValueError`` with the offending
+    values embedded in the message.
+    """
+    if sp_size <= 1:
+        return
+    if not distributed:
+        raise ValueError(
+            f"--sp-size={sp_size} requires distributed training (torchrun); "
+            "launch with torchrun or set --sp-size=1"
+        )
+    if speculator_type not in SP_SUPPORTED_SPECULATORS:
+        raise ValueError(
+            f"--sp-size={sp_size} is not supported for speculator_type="
+            f"{speculator_type}; sequence parallelism is implemented for "
+            f"{sorted(SP_SUPPORTED_SPECULATORS)} only"
+        )
+    if fsdp_shard:
+        # ``apply_fully_sharded`` shards over the default world mesh, which
+        # includes the SP ranks; ``reduce_sp_gradients`` would then SUM
+        # *different* parameter shards across the SP group.  A DP-only mesh
+        # (SP replicated) is required before this combination can be enabled
+        # (see docs/01 §M3.6).
+        raise ValueError(
+            f"--sp-size={sp_size} is not supported together with --fsdp-shard: "
+            "FSDP shards over the full world, so SP ranks hold different "
+            "parameter shards and the SP gradient reduction would be incorrect. "
+            "A DP-only FSDP mesh (SP replicated) is required (M3.6)."
+        )
+    if world_size % sp_size != 0:
+        raise ValueError(
+            f"world_size ({world_size}) must be divisible by sp_size ({sp_size})"
+        )
+    if total_seq_len is not None and total_seq_len % sp_size != 0:
+        raise ValueError(
+            f"total_seq_len ({total_seq_len}) must be divisible by sp_size "
+            f"({sp_size})"
+        )
+    if max_anchors is not None and max_anchors % sp_size != 0:
+        raise ValueError(
+            f"max_anchors ({max_anchors}) must be divisible by sp_size ({sp_size})"
+        )
+    if (
+        num_attention_heads is not None
+        and num_attention_heads % sp_size != 0
+        and sp_size % num_attention_heads != 0
+    ):
+        raise ValueError(
+            f"num_attention_heads ({num_attention_heads}) and sp_size ({sp_size}) "
+            "must divide one another"
+        )
 
 
 def set_seed(seed: int, deterministic: bool = False):
@@ -538,11 +610,45 @@ def build_draft_model(
       config file; build the rest of the speculator from the other CLI args.
     * neither: synthesize the decoder from the verifier config + CLI flags.
 
+    * ``--from-released``: start from a *released deploy-format* draft (flat
+      qwen3-style config + tensors, no speculators_config).  The draft config
+      is derived from the release, its tensors load by name+shape, and the
+      verifier-owned tensors (embed/lm_head/verifier_*) are rebuilt from
+      ``--verifier-name-or-path``.
+    * ``--draft-config``: take the decoder ``transformer_layer_config`` from a
+      config file; build the rest of the speculator from the other CLI args.
+    * neither: synthesize the decoder from the verifier config + CLI flags.
+
     MTP is special-cased: when not loading ``--from-pretrained``, it reuses the
     verifier's own decoder config as the draft ``transformer_layer_config`` and
     extracts the native MTP head weights from the verifier, so the decoder-shaping
     flags and ``--draft-config`` do not apply.
     """
+    if getattr(args, "from_released", ""):
+        # Released deploy-format draft (GLM-5.3-DSpark / GLM-5.3-DFlash2, or a
+        # packed public release such as UCloud GLM-5.2-FP8-DFlash): the config
+        # comes from the release itself, the draft tensors load by name+shape
+        # (packed releases also carry the target's frozen embed/lm_head, which
+        # the verifier rebuild overwrites), and the mask token / aux layer ids
+        # come with it, so the tokenizer-based resolution further below does
+        # not apply.  Production builds fail closed: anything the release
+        # cannot satisfy is an error rather than silently-random weights.
+        draft_model, _released_stats = build_draft_from_released(
+            speculator_type=args.speculator_type,
+            released_dir=args.from_released,
+            verifier_name_or_path=args.verifier_name_or_path,
+            t2d=t2d,
+            d2t=d2t,
+            draft_vocab_size=draft_vocab_size,
+            num_layers=getattr(args, "num_layers", None),
+            target_layer_ids=args.target_layer_ids,
+            draft_attn_impl=args.draft_attn_impl,
+            trust_remote_code=getattr(args, "trust_remote_code", False),
+            init_unloaded="error",
+        )
+        args.draft_vocab_size = draft_model.config.draft_vocab_size
+        return draft_model
+
     if args.from_pretrained:
         if is_config_only_dir(args.from_pretrained):
             logger.info(
@@ -642,7 +748,21 @@ def main(cfg: TrainConfig):  # noqa: C901
     )
 
     # Setup distributed training
-    maybe_setup_distributed()
+    # Sequence parallelism is validated before the process groups are created so
+    # an unsupported combination fails closed instead of training silently wrong.
+    _validate_sp_config(
+        world_size=int(os.environ.get("WORLD_SIZE", "1")),
+        sp_size=args.sp_size,
+        speculator_type=args.speculator_type,
+        total_seq_len=args.total_seq_len,
+        max_anchors=args.max_anchors,
+        # Attention-head divisibility is validated where the draft config is
+        # built (the verifier config is not resolved yet at this point).
+        num_attention_heads=None,
+        distributed="LOCAL_RANK" in os.environ,
+        fsdp_shard=args.fsdp_shard,
+    )
+    maybe_setup_distributed(sp_size=args.sp_size)
 
     # Publish train config to metric backends that support hyperparameter logging
     log_run_config(cfg)
@@ -800,6 +920,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         gradient_checkpointing=args.gradient_checkpointing,
         max_steps=args.max_steps,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        total_seq_len=args.total_seq_len,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 

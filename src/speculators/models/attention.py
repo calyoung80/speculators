@@ -163,3 +163,20 @@ def block_mask_to_dense_attention_mask(
 # Singleton registry for attention functions (shared across all models)
 ALL_ATTENTION_FUNCTIONS = AttentionInterface()
 ALL_ATTENTION_FUNCTIONS.register("simple_flex_attention", flex_attention_forward)
+
+
+def _dflash_sdpa_sp_attention(*args, **kwargs):
+    """Lazy entry point for the Ulysses SDPA attention kernel.
+
+    Registered unconditionally so that ``ALL_ATTENTION_FUNCTIONS[
+    "dflash_sdpa_sp_attention"]`` always resolves; the import is deferred so the
+    models package does not depend on the training package at import time.
+    """
+    from speculators.train.sequence_parallel import (
+        dflash_sdpa_sp_attention,
+    )
+
+    return dflash_sdpa_sp_attention(*args, **kwargs)
+
+
+ALL_ATTENTION_FUNCTIONS.register("dflash_sdpa_sp_attention", _dflash_sdpa_sp_attention)

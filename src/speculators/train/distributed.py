@@ -212,6 +212,85 @@ def _frozen_params(model: torch.nn.Module) -> set[torch.nn.Parameter]:
     return {p for p in model.parameters() if not p.requires_grad}
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint weight distribution
+# ---------------------------------------------------------------------------
+
+
+def broadcast_module_state_from_rank0(model: torch.nn.Module) -> int:
+    """Copy global rank 0's parameters **and buffers** to every rank.
+
+    Only rank 0 reads a checkpoint from disk, so the loaded weights must be
+    distributed explicitly.  ``DistributedDataParallel`` broadcasts from the
+    root of *its* process group; under SP that group is the strided DP group
+    (``{0, 2}``, ``{1, 3}``, ...), so only one DP group contains rank 0 and the
+    others would keep freshly initialised weights.  Broadcasting over the world
+    group first makes every rank identical, after which DDP's own per-group
+    broadcast (params and buffers) is a semantic no-op.
+
+    Returns the number of tensors broadcast (0 when world size is 1).
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return 0
+    tensors = [*model.parameters(), *model.buffers()]
+    for tensor in tensors:
+        # collectives require contiguous storage; buffers such as a sliced RoPE
+        # cache may be non-contiguous views.
+        if not tensor.is_contiguous():
+            tensor.data = tensor.data.contiguous()
+        dist.broadcast(tensor.data, src=0)
+    return len(tensors)
+
+
+# ---------------------------------------------------------------------------
+# Sequence-parallel gradient reduction
+# ---------------------------------------------------------------------------
+
+
+def sp_grad_local_tensor(grad: torch.Tensor) -> torch.Tensor:
+    """Return the locally-owned shard of *grad* (pass-through for plain tensors).
+
+    Under FSDP2 the accumulated gradient of a sharded parameter is a
+    ``DTensor``; the SP all-reduce must only touch the local shard.
+    ``to_local()`` is the public API and is preferred; ``_local_tensor`` is kept
+    as a fallback for older torch builds.
+    """
+    to_local = getattr(grad, "to_local", None)
+    if callable(to_local):
+        return to_local()
+    local = getattr(grad, "_local_tensor", None)
+    if local is not None:
+        return local
+    return grad
+
+
+def reduce_sp_gradients(model: torch.nn.Module) -> int:
+    """Sum the accumulated gradients across the SP group. Call once per step.
+
+    Must run after the whole gradient-accumulation loop and *before*
+    ``clip_grad_norm_`` / ``optimizer.step()`` so that clipping sees the global
+    gradient norm. Doing it per micro-batch would re-reduce gradients that are
+    already accumulated and scale the earlier micro-batches by ``sp_size``.
+
+    The reduction is deliberately *not* implemented with per-parameter hooks: an
+    explicit step-boundary call is idempotent per step and immune to FSDP2
+    replacing parameter objects or to checkpoint restore.
+
+    Returns the number of gradients that were reduced (0 when SP is off).
+    """
+    if _sp_size <= 1 or _sp_group is None or not dist.is_initialized():
+        return 0
+
+    reduced = 0
+    for param in model.parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        dist.all_reduce(sp_grad_local_tensor(grad), group=_sp_group)
+        reduced += 1
+    return reduced
+
+
 def apply_fully_sharded(
     model: torch.nn.Module,
     param_dtype: torch.dtype = torch.bfloat16,
@@ -224,7 +303,23 @@ def apply_fully_sharded(
     before calling this function. With replicate_frozen=True, frozen parameters
     stay replicated on each rank instead of being sharded and all-gathered.
     This trades per-rank memory for reduced communication.
+
+    Raises:
+        ValueError: when sequence parallelism is enabled. ``fully_shard`` uses
+            the default world mesh, so SP ranks would hold *different* parameter
+            shards and :func:`reduce_sp_gradients` would sum incompatible
+            shards. A DP-only mesh (SP replicated) is required first; until
+            then the combination fails closed here, not only in the CLI.
     """
+    if _sp_size > 1:
+        raise ValueError(
+            f"FSDP2 (apply_fully_sharded) cannot be combined with sp_size="
+            f"{_sp_size}: fully_shard() shards over the full world mesh, so SP "
+            "ranks hold different parameter shards and the SP gradient "
+            "reduction would be incorrect. A DP-only FSDP mesh with the SP "
+            "dimension replicated is required (see docs/01 §M3.6)."
+        )
+
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=torch.float32,

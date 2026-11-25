@@ -192,6 +192,24 @@ class DraftArgs(_Group):
         description="Attention implementation for draft layers. Use 'sdpa' or 'eager' "
         "for hardware that doesn't support flex attention.",
     )
+    # Declared last (after draft_attn_impl) so the flatten() key order of
+    # pre-existing runs is unchanged; only new runs emit this key.
+    from_released: str = Field(
+        default="",
+        description="Path to a *released* draft checkpoint in deploy (vLLM) format "
+        "(GLM-5.3 style, e.g. /mnt/cephfs/weight/GLM-5.3-DSpark, or a packed public "
+        "release such as UCloud GLM-5.2-FP8-DFlash): a flat qwen3-style config.json "
+        "plus model.safetensors, without speculators_config. The draft is built "
+        "from the released dimensions (layers, kv heads, aux target layers, "
+        "markov/conv/selector knobs), the released tensors load by exact "
+        "name+shape, and the verifier-owned tensors (embed_tokens/lm_head/"
+        "verifier_lm_head/verifier_norm) are rebuilt from "
+        "--verifier-name-or-path (packed releases that ship embed/lm_head get "
+        "them overwritten by the verifier rebuild). Mutually exclusive with "
+        "--from-pretrained and --draft-config. --num-layers defaults to the "
+        "released layer count; pass it explicitly only for reduced-layer smoke "
+        "profiles.",
+    )
 
 
 class DataArgs(_Group):
@@ -222,13 +240,7 @@ class DataArgs(_Group):
         "(recommended). float16 is not supported (requires gradient scaling).",
     )
     num_workers: int = Field(default=12, description="Number of dataloader workers.")
-    prefetch_factor: int = Field(
-        default=4,
-        description="Dataloader prefetch factor: batches buffered ahead of the "
-        "training loop (torch DataLoader worker slots; for the streaming "
-        "loader it sizes both the outstanding send batches and the "
-        "assembled-batch queue).",
-    )
+    prefetch_factor: int = Field(default=4, description="Dataloader prefetch factor: batches buffered ahead of the training loop (torch DataLoader worker slots; for the streaming loader it sizes both the outstanding send batches and the assembled-batch queue).")
     dataloader: Literal["torch", "streaming"] = Field(
         default="torch",
         description="Train dataloader implementation. 'torch' pre-packs batches and "
@@ -262,7 +274,7 @@ class DataArgs(_Group):
     def _dtype_is_torch_attr(cls, v: str) -> str:
         # Local import keeps this schema module purely declarative and torch-free
         # at import time; torch is only needed to validate the dtype string.
-        import torch  # noqa: PLC0415
+        import torch
 
         # hasattr alone is too weak: torch.nn / torch.cuda / torch.Tensor all
         # exist but are not dtypes and would only fail later as an opaque
@@ -486,6 +498,15 @@ class TrainerArgs(_Group):
         ge=1,
         description="Number of micro-batches to accumulate gradients over before "
         "calling optimizer.step().",
+    )
+    sp_size: int = Field(
+        default=1,
+        ge=1,
+        description="Ulysses sequence-parallel degree. The sequence dimension is "
+        "sharded across sp_size consecutive ranks (SP group); the remaining ranks "
+        "form the data-parallel groups. Requires torchrun and "
+        "world_size % sp_size == 0. Only DFlash-family drafts (dflash, dspark, "
+        "dflash2) are supported.",
     )
 
     @field_validator("checkpoint_freq")
@@ -876,7 +897,12 @@ class TrainConfig(BaseSettings):
             self.draft.sliding_window_non_causal = self.speculator_type == "dflash2"
         if self.optimizer.muon_lr is None:
             self.optimizer.muon_lr = self.optimizer.lr
-        if self.draft.num_layers is None:
+        # With --from-released the layer count comes from the released
+        # checkpoint; resolving the generic default here would silently build
+        # 5 layers for a 6-layer release (DFlash2) and drop real tensors.
+        # num_layers therefore stays None (meaning "use the release") unless
+        # the user passes it explicitly for a reduced-layer smoke profile.
+        if self.draft.num_layers is None and not self.draft.from_released:
             self.draft.num_layers = 5 if is_dflash_family else 1
         if self.dflash.per_position_loss_weight is None:
             self.dflash.per_position_loss_weight = (
@@ -923,6 +949,37 @@ class TrainConfig(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_draft_init_source(self) -> "TrainConfig":
+        """The draft init sources are mutually exclusive: --from-pretrained
+        (saved speculator checkpoint), --draft-config (decoder config file) and
+        --from-released (deploy-format release) each fully determine how the
+        draft is built, so combining them would silently ignore one of them."""
+        selected = [
+            name
+            for name, value in (
+                ("--from-pretrained", self.draft.from_pretrained),
+                ("--draft-config", self.draft.draft_config),
+                ("--from-released", self.draft.from_released),
+            )
+            if value
+        ]
+        if len(selected) > 1:
+            raise ValueError(
+                "draft init sources are mutually exclusive; got "
+                f"{sorted(selected)}"
+            )
+        if self.draft.from_released and self.speculator_type not in {
+            "dspark",
+            "dflash",
+            "dflash2",
+        }:
+            raise ValueError(
+                "--from-released is only supported for speculator_type "
+                "'dspark', 'dflash' or 'dflash2', got {self.speculator_type!r}"
+            )
+        return self
+
     def flatten(self) -> dict[str, Any]:
         """The flat ``vars(args)``-shaped dict the ``SpeculatorModel`` classes
         consume via ``**kwargs``.
@@ -944,7 +1001,7 @@ class TrainConfig(BaseSettings):
         """Inverse of :meth:`flatten`: recover the typed config from a flat
         working-dict. Non-config keys are dropped; the value validators are
         idempotent on already-resolved values."""
-        from speculators.train.config.resolution import (  # noqa: PLC0415
+        from speculators.train.config.resolution import (
             _BACKEND_DESTS,  # circular
         )
 
@@ -975,7 +1032,7 @@ class TrainConfig(BaseSettings):
         the pydantic schema. This is the primary test seam -- it can be exercised
         without ``sys.argv``.
         """
-        from speculators.train.config import resolution  # noqa: PLC0415
+        from speculators.train.config import resolution
 
         return resolution.build_from_sources(
             cls, cli=cli, config_path=config_path, argv=argv, backend_cli=backend_cli
@@ -988,7 +1045,7 @@ class TrainConfig(BaseSettings):
         Turns any configuration error into a clean ``SystemExit(2)``. This is what
         the ``speculators train`` command calls.
         """
-        from speculators.train.config import resolution  # noqa: PLC0415
+        from speculators.train.config import resolution
 
         return resolution.resolve(cls, argv)
 
@@ -998,14 +1055,14 @@ class TrainConfig(BaseSettings):
         The ``train:``-wrapped form, clean of provenance annotations, so it
         re-loads identically via ``--config`` (see ``artifacts`` for the writer).
         """
-        from speculators.train.config import artifacts  # noqa: PLC0415
+        from speculators.train.config import artifacts
 
         return artifacts.dump_yaml(self)
 
     def save(self, save_dir: str) -> None:
         """Write the reproducibility artifacts (``run.yaml`` + ``train_command.txt``)
         next to the checkpoints. Called at rank 0."""
-        from speculators.train.config import artifacts  # noqa: PLC0415
+        from speculators.train.config import artifacts
 
         artifacts.save(self, save_dir)
 

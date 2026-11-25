@@ -5,7 +5,7 @@ import warnings
 from collections.abc import Callable
 from contextlib import nullcontext
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import Literal, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -30,19 +30,20 @@ from speculators.train.checkpointer import (
 )
 from speculators.train.distributed import (
     apply_fully_sharded,
+    broadcast_module_state_from_rank0,
+    get_dp_group,
     get_local_rank,
     get_rank,
+    get_sp_rank,
+    get_sp_size,
     is_distributed,
+    reduce_sp_gradients,
 )
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
 from speculators.train.recovery import BatchRecoveryCoordinator
+from speculators.train.sequence_parallel import split_batch_for_sp
 from speculators.train.utils import normalize_counted_metrics
-
-if TYPE_CHECKING:
-    from speculators.train.streaming_dataloader import (
-        StreamingDataLoader,  # noqa: TC004
-    )
 
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
@@ -207,6 +208,9 @@ class TrainerConfig(NamedTuple):
     gradient_checkpointing: bool = False
     max_steps: int | None = None
     gradient_accumulation_steps: int = 1
+    # Configured packed sequence width, forwarded to the model so SP mismatch
+    # errors can report both the actual and the configured value.
+    total_seq_len: int | None = None
 
 
 def _resolve_scheduler_steps(
@@ -218,14 +222,16 @@ def _resolve_scheduler_steps(
     Explicit ``scheduler_warmup_steps`` wins; otherwise ``scheduler_warmup_ratio``
     (a fraction of total steps, validated to ``[0, 1]``) is used; otherwise the
     default of 1% of the resolved total steps. ``scheduler_total_steps`` defaults
-    to ``max_steps`` when set, else ``num_epochs * train_loader_len``.
+    to ``max_steps`` when set, else ``num_epochs * train_loader_len`` (in
+    optimizer steps: divided by ``gradient_accumulation_steps``), so the LR
+    decays over the same horizon ``max_steps`` stops the loop at.
     """
-    default_total_steps = (config.num_epochs * train_loader_len) // max(
-        config.gradient_accumulation_steps, 1
-    )
+    default_total_steps = (config.num_epochs * train_loader_len) // max(config.gradient_accumulation_steps, 1)
     scheduler_total_steps = (
         config.scheduler_total_steps
         if config.scheduler_total_steps is not None
+        else config.max_steps
+        if config.max_steps is not None
         else default_total_steps
     )
 
@@ -254,8 +260,8 @@ class Trainer:
         self,
         model: SpeculatorModel,
         config: TrainerConfig,
-        train_loader: DataLoader | StreamingDataLoader,
-        val_loader: DataLoader | StreamingDataLoader | None = None,
+        train_loader: DataLoader,
+        val_loader: DataLoader | None = None,
     ):
         self.model = model
         self.config = config
@@ -264,6 +270,14 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.is_distributed = is_distributed()
+        # DFlash-family drafts shard the sequence inside the model instead of
+        # splitting the batch in the trainer.
+        self._sp_splits_batch = getattr(model, "_sp_splits_batch", True)
+        # The model cannot know the configured packed width (it is a data
+        # config value), but it needs it to report a useful mismatch error when
+        # a real batch has a different length under SP.
+        if config.total_seq_len is not None:
+            model._configured_seq_len = config.total_seq_len
         self.resume_from_checkpoint = config.resume_from_checkpoint
         acc = torch.accelerator.current_accelerator()
         self.device_type = acc.type if acc is not None else "cuda"
@@ -284,11 +298,7 @@ class Trainer:
     def _loader_state_path(self, epoch: int) -> Path:
         # Streaming loader state (consumed-record bitmap) is per-rank, so each
         # rank snapshots its own file next to the rank-0 training state.
-        return (
-            self.checkpointer.path
-            / str(epoch)
-            / f"loader_state_rank{self.rank}.json"
-        )
+        return self.checkpointer.path / str(epoch) / f"loader_state_rank{self.rank}.json"
 
     def _save_training_state(self, epoch: int, local_step: int) -> None:
         if not self.is_distributed or dist.get_rank() == 0:
@@ -296,6 +306,10 @@ class Trainer:
                 "epoch": epoch,
                 "local_step": local_step,
                 "global_step": self.global_step,
+                # Topology snapshot for resume validation (02 §2.12): the MVP
+                # only supports resuming with the same sp_size / world_size.
+                "sp_size": get_sp_size(),
+                "world_size": dist.get_world_size() if self.is_distributed else 1,
             }
             p = self._training_state_path(epoch)
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -306,29 +320,113 @@ class Trainer:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(loader_state()))
 
-    def _load_loader_state(self) -> dict:
+    def _load_loader_state(self) -> dict | None:
+        """Load this epoch's loader state, or ``None`` when it is absent.
+
+        Same policy as :meth:`_load_training_state`: an unreadable file is a hard
+        error rather than an empty state.  Silently returning ``{}`` would make
+        the streaming loader re-consume records the checkpoint already trained
+        on (and, under SP, hide the inconsistency behind a successful resume).
+        """
         epoch = self.checkpointer.previous_epoch
         p = self._loader_state_path(epoch)
-        if p.exists():
-            try:
-                return json.loads(p.read_text())
-            except json.JSONDecodeError as e:
-                root_logger.warning(f"Failed to decode loader state {p}: {e}")
-            except (FileNotFoundError, PermissionError, OSError) as e:
-                root_logger.warning(f"Failed to read loader state {p}: {e}")
-        return {}
+        if not p.exists():
+            return None
+        try:
+            state = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            raise ValueError(
+                f"Checkpoint at epoch {epoch} exists but its loader state {p} "
+                f"is unreadable ({e}); refusing to resume with an unknown set "
+                "of already-consumed records."
+            ) from e
+        if not isinstance(state, dict):
+            raise ValueError(
+                f"loader state {p} must be a JSON object, got "
+                f"{type(state).__name__}; refusing to resume."
+            )
+        return state
 
-    def _load_training_state(self) -> dict:
+    def _load_training_state(self) -> dict | None:
+        """Load this epoch's training state, or ``None`` when it is absent.
+
+        A *present* but unreadable file is a hard error: silently treating it as
+        empty would restart the epoch from step 0 and, under sequence
+        parallelism, would skip the resume-topology check entirely.
+        """
         epoch = self.checkpointer.previous_epoch
         p = self._training_state_path(epoch)
-        if p.exists():
-            try:
-                return json.loads(p.read_text())
-            except json.JSONDecodeError as e:
-                root_logger.warning(f"Failed to decode training state {p}: {e}")
-            except (FileNotFoundError, PermissionError, OSError) as e:
-                root_logger.warning(f"Failed to read training state {p}: {e}")
-        return {}
+        if not p.exists():
+            return None
+        try:
+            state = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            raise ValueError(
+                f"Checkpoint at epoch {epoch} exists but its training state "
+                f"{p} is unreadable ({e}); refusing to resume from an "
+                "inconsistent step/topology record."
+            ) from e
+        if not isinstance(state, dict):
+            # Valid JSON of the wrong shape (list/str/number): the callers rely
+            # on ``.get``, so reject it instead of raising AttributeError later.
+            raise ValueError(
+                f"training state {p} must be a JSON object, got "
+                f"{type(state).__name__}; refusing to resume."
+            )
+        return state
+
+    def _validate_resume_topology(self, state: dict | None) -> None:
+        """Refuse to resume a checkpoint produced with a different topology.
+
+        ``training_state.json`` written by this process carries ``sp_size`` and
+        ``world_size``. Optimizer/FSDP sharding is not portable across
+        topologies, so a mismatch is a hard error (02 §2.12). Checkpoints
+        without topology metadata (pre-SP, or a directory that only holds
+        weights) can only be resumed with ``sp_size == 1``; under SP we cannot
+        prove the sharding matches, so they are rejected.
+        """
+        current_sp = get_sp_size()
+        current_world = dist.get_world_size() if self.is_distributed else 1
+        if not state:
+            # No training_state.json at all (or an empty object).
+            if current_sp > 1:
+                raise ValueError(
+                    "Checkpoint has no training_state.json (no topology "
+                    f"metadata) but the current run uses sp_size={current_sp}: "
+                    "cannot verify that the checkpoint was produced with the "
+                    "same sequence-parallel topology, refusing to resume."
+                )
+            root_logger.warning(
+                "Checkpoint has no training_state.json; resuming without a "
+                "step record (safe only because sp_size=1)."
+            )
+            return
+        checkpoint_sp = state.get("sp_size")
+        checkpoint_world = state.get("world_size")
+        if checkpoint_sp is None and checkpoint_world is None:
+            root_logger.warning(
+                "Checkpoint has no topology metadata (pre-SP format); "
+                "assuming it was saved with sp_size=1."
+            )
+            if current_sp > 1:
+                raise ValueError(
+                    "Refusing to resume a pre-SP checkpoint (no topology "
+                    f"metadata) with sp_size={current_sp}: resuming across "
+                    "topologies is not supported."
+                )
+            return
+        if checkpoint_sp is not None and checkpoint_sp != current_sp:
+            raise ValueError(
+                f"Checkpoint was saved with sp_size={checkpoint_sp} but the "
+                f"current run uses sp_size={current_sp}; resuming across "
+                "topologies is not supported (02 §2.12)."
+            )
+        if checkpoint_world is not None and checkpoint_world != current_world:
+            raise ValueError(
+                f"Checkpoint was saved with world_size={checkpoint_world} but "
+                f"the current run has world_size={current_world}; resuming "
+                "across topologies is not supported (02 §2.12)."
+            )
 
     def setup_trainer(self):
         if self.checkpointer.previous_epoch != -1:
@@ -338,6 +436,7 @@ class Trainer:
                 # Check if this was a mid-epoch checkpoint — if so, resume
                 # from within that epoch rather than jumping to the next one.
                 state = self._load_training_state()
+                self._validate_resume_topology(state)
                 is_mid_epoch = (
                     state
                     and state.get("epoch") == self.checkpointer.previous_epoch
@@ -453,23 +552,11 @@ class Trainer:
                     f"{type(self.model).__name__} does not support "
                     "gradient checkpointing"
                 )
-            self.model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             root_logger.info("Gradient checkpointing enabled")
-            _n_has = sum(
-                1
-                for _m in self.model.modules()
-                if hasattr(_m, "gradient_checkpointing")
-            )
-            _n_on = sum(
-                1
-                for _m in self.model.modules()
-                if getattr(_m, "gradient_checkpointing", False)
-            )
-            root_logger.info(
-                "GCL_PROBE_TRAINER: has_attr=%d enabled=%d", _n_has, _n_on
-            )
+            _n_has = sum(1 for _m in self.model.modules() if hasattr(_m, "gradient_checkpointing"))
+            _n_on = sum(1 for _m in self.model.modules() if getattr(_m, "gradient_checkpointing", False))
+            root_logger.info("GCL_PROBE_TRAINER: has_attr=%d enabled=%d" % (_n_has, _n_on))
 
         load_checkpoint = (
             self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1
@@ -522,19 +609,26 @@ class Trainer:
     def _setup_model_ddp(self, load_checkpoint: bool):
         self.model.to(self.local_rank)  # type: ignore[arg-type]
 
-        if load_checkpoint:
-            if dist.get_rank() == 0:
-                self.checkpointer.load_model_state_dict(
-                    self.model, float_dtype=_CHECKPOINT_FLOAT_DTYPE
-                )
-        else:
-            # Fresh init: broadcast rank 0's random initialization to all ranks
-            for param in self.model.parameters():
-                dist.broadcast(param.data, src=0)
-            dist.barrier()
+        if load_checkpoint and dist.get_rank() == 0:
+            self.checkpointer.load_model_state_dict(
+                self.model, float_dtype=_CHECKPOINT_FLOAT_DTYPE
+            )
 
-        # DDP constructor broadcasts rank 0's params to all ranks
-        self.model = DistributedDataParallel(self.model)  # type: ignore[assignment]
+        # Broadcast rank 0's parameters *and buffers* over the world group, not
+        # just the DP group.  With SP the DP groups are strided ({0,2}, {1,3},
+        # ...), so only one of them contains global rank 0; relying on DDP's own
+        # group-scoped broadcast would hand rank 1's freshly-initialised weights
+        # (and buffers) to its DP peers and silently resume from a random model.
+        broadcast_module_state_from_rank0(self.model)
+        dist.barrier()
+
+        # DDP averages gradients over the strided DP group only: SP ranks hold
+        # sequence slices of the *same* samples, so their contributions must be
+        # summed by reduce_sp_gradients() instead of averaged by DDP.
+        dp_group = get_dp_group()
+        self.model = DistributedDataParallel(  # type: ignore[assignment]
+            self.model, process_group=dp_group
+        )
 
     def setup_optimizer(self):
         # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the
@@ -689,6 +783,12 @@ class Trainer:
                 for k, v in batch.items()
             }
 
+            if self._sp_splits_batch:
+                # Split-mode models (eagle3/peagle) consume a sequence-sharded
+                # batch.  DFlash-family models shard internally and keep the full
+                # batch (`_sp_splits_batch = False`).
+                gpu_batch = split_batch_for_sp(gpu_batch, get_sp_rank(), get_sp_size())
+
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype
             ):
@@ -710,6 +810,11 @@ class Trainer:
             if not is_sync_step:
                 t_before_fetch = time.perf_counter()
                 continue
+
+            # Sequence-parallel gradient reduction: exactly once per optimizer
+            # step, after the accumulation loop and before clipping, so the clip
+            # norm is the global one.  No-op when sp_size == 1.
+            reduce_sp_gradients(self.model)
 
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
@@ -737,6 +842,8 @@ class Trainer:
             profile = None
             if timer.enabled:
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
+                # Each SP rank only processes 1/sp_size of the sequence.
+                num_tokens = max(1, num_tokens // max(1, get_sp_size()))
                 profile = timer.profile(num_tokens)
                 if self.is_distributed:
                     metrics = _all_reduce_metrics(metrics)
@@ -812,6 +919,9 @@ class Trainer:
                 else v
                 for k, v in batch.items()
             }
+
+            if self._sp_splits_batch:
+                gpu_batch = split_batch_for_sp(gpu_batch, get_sp_rank(), get_sp_size())
 
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype
