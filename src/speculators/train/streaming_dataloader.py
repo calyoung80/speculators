@@ -49,8 +49,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
-from hs_connectors.device import ensure_thread_context
 
+from hs_connectors.device import ensure_thread_context
 from speculators.train.recovery import GenerationRecoveryGuard, SampleUnavailable
 
 if TYPE_CHECKING:
@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 # ``in_flight_batches`` and the vLLM service rate.
 DEFAULT_YIELD_QUEUE_DEPTH = 4
 _MIN_QUEUED_BATCHES = 2
+_MAX_SAMPLE_LEN = int(os.environ.get("SPECULATORS_MAX_SAMPLE_LEN", "0"))
 
 _SENTINEL = object()
 
@@ -237,7 +238,9 @@ class StreamingDataLoader:
     def _slice_indices(self, epoch: int) -> np.ndarray:
         """Rank slice of the shuffled dataset (same seeding as Multipack)."""
         lengths = np.asarray(self.dataset.approx_lengths)
-        valid = np.nonzero(lengths <= self.batch_max_length)[0]
+        valid = np.nonzero(
+            lengths <= max(self.batch_max_length, _MAX_SAMPLE_LEN)
+        )[0]
         rng = np.random.default_rng(seed=self.seed + epoch)
         shuffled = rng.permutation(valid)
         # Multipack balances replicas via LPT; arrival-order packing cannot,

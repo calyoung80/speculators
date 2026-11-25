@@ -27,6 +27,8 @@ import threading
 from functools import wraps
 from typing import Any
 
+import torch
+
 logger = logging.getLogger("speculators")
 
 # Default timeout for coordinated shutdown save (seconds)
@@ -136,7 +138,11 @@ def with_graceful_shutdown(
             handler.install()
 
             try:
-                return fn(self, *args, **kwargs)
+                try:
+                    return fn(self, *args, **kwargs)
+                except torch.OutOfMemoryError:
+                    _mem_census()
+                    raise
             except TrainingInterruptedError:
                 handler.restore()
 
@@ -177,3 +183,43 @@ def with_graceful_shutdown(
         return wrapper
 
     return decorator
+
+
+def _mem_census() -> None:
+    import gc
+    from collections import defaultdict
+
+    try:
+        import torch.distributed as dist
+
+        rank = dist.get_rank() if dist.is_initialized() else -1
+    except Exception:  # noqa: BLE001
+        rank = -1
+    agg = defaultdict(lambda: [0, 0])
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                dev = getattr(obj, "device", None)
+                if dev is not None and dev.type == "npu":
+                    key = (tuple(obj.shape), str(obj.dtype))
+                    nbytes = obj.numel() * obj.element_size()
+                    agg[key][0] += 1
+                    agg[key][1] += nbytes
+        except Exception:  # noqa: BLE001, S110
+            pass
+    try:
+        alloc = torch.npu.memory_allocated() / 2**30
+        logger.info("[MEMCENSUS r%s] torch_npu_alloc=%.2fGiB", rank, alloc)
+    except (AttributeError, RuntimeError):
+        pass
+    for (shape, dtype), (count, nbytes) in sorted(
+        agg.items(), key=lambda kv: -kv[1][1]
+    )[:25]:
+        logger.info(
+            "[MEMCENSUS r%s] %s %s x%d = %.2fGiB",
+            rank,
+            shape,
+            dtype,
+            count,
+            nbytes / 2**30,
+        )

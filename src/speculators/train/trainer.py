@@ -1,9 +1,9 @@
-from contextlib import nullcontext
 import json
 import logging
 import time
 import warnings
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
@@ -40,7 +40,9 @@ from speculators.train.recovery import BatchRecoveryCoordinator
 from speculators.train.utils import normalize_counted_metrics
 
 if TYPE_CHECKING:
-    from speculators.train.streaming_dataloader import StreamingDataLoader
+    from speculators.train.streaming_dataloader import (
+        StreamingDataLoader,  # noqa: TC004
+    )
 
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
@@ -218,7 +220,9 @@ def _resolve_scheduler_steps(
     default of 1% of the resolved total steps. ``scheduler_total_steps`` defaults
     to ``max_steps`` when set, else ``num_epochs * train_loader_len``.
     """
-    default_total_steps = (config.num_epochs * train_loader_len) // max(config.gradient_accumulation_steps, 1)
+    default_total_steps = (config.num_epochs * train_loader_len) // max(
+        config.gradient_accumulation_steps, 1
+    )
     scheduler_total_steps = (
         config.scheduler_total_steps
         if config.scheduler_total_steps is not None
@@ -280,7 +284,11 @@ class Trainer:
     def _loader_state_path(self, epoch: int) -> Path:
         # Streaming loader state (consumed-record bitmap) is per-rank, so each
         # rank snapshots its own file next to the rank-0 training state.
-        return self.checkpointer.path / str(epoch) / f"loader_state_rank{self.rank}.json"
+        return (
+            self.checkpointer.path
+            / str(epoch)
+            / f"loader_state_rank{self.rank}.json"
+        )
 
     def _save_training_state(self, epoch: int, local_step: int) -> None:
         if not self.is_distributed or dist.get_rank() == 0:
@@ -445,8 +453,23 @@ class Trainer:
                     f"{type(self.model).__name__} does not support "
                     "gradient checkpointing"
                 )
-            self.model.gradient_checkpointing_enable()
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
             root_logger.info("Gradient checkpointing enabled")
+            _n_has = sum(
+                1
+                for _m in self.model.modules()
+                if hasattr(_m, "gradient_checkpointing")
+            )
+            _n_on = sum(
+                1
+                for _m in self.model.modules()
+                if getattr(_m, "gradient_checkpointing", False)
+            )
+            root_logger.info(
+                "GCL_PROBE_TRAINER: has_attr=%d enabled=%d", _n_has, _n_on
+            )
 
         load_checkpoint = (
             self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1
