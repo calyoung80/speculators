@@ -116,7 +116,7 @@ def dpace_loss_decay(
 def _fused_kernel(name: str):
     """Import a fused loss by name."""
     try:
-        from speculators.losses import fused as mod  # noqa: PLC0415
+        from speculators.losses import fused as mod
     except ImportError as error:
         raise RuntimeError(
             "Fused losses require Triton; use --loss-implementation eager for "
@@ -349,17 +349,36 @@ def _reduce_elementwise_loss(
 ) -> torch.Tensor:
     """Mask, optionally decay, and average a per-position loss (see
     ``loss_function``).
+
+    Under sequence parallelism each rank owns only a slice of the sequence, so
+    the numerator (masked/decayed loss sum) and the raw token count are summed
+    across the SP group *before* the epsilon is added. Adding the epsilon first
+    would give every rank its own ``eps`` and inflate the global denominator by
+    ``sp_size * eps``.
     """
-    loss_mask = loss_mask.to(elementwise_loss.dtype)
-    elementwise_loss = elementwise_loss * loss_mask
+    loss_mask_f = loss_mask.to(elementwise_loss.dtype)
+    weighted = elementwise_loss * loss_mask_f
 
     if decay_fn is not None:
-        decay_mult = decay_fn(
-            pos_idx.to(elementwise_loss.dtype), elementwise_loss=elementwise_loss
-        )
-        elementwise_loss = elementwise_loss * decay_mult
+        decay_mult = decay_fn(pos_idx.to(weighted.dtype), elementwise_loss=weighted)
+        weighted = weighted * decay_mult
 
-    denominator = loss_mask.sum(dim=1) + _LOSS_REDUCTION_EPS
+    numerator = torch.sum(weighted, dim=1)  # shape: [1]
+    denominator = torch.sum(loss_mask_f, dim=1)  # shape: [1], raw count
 
-    batch_loss = torch.sum(elementwise_loss, dim=1) / denominator  # shape: [1]
+    if _sp_size() > 1:
+        from speculators.train.sequence_parallel import sp_ratio_reduce
+
+        numerator, denominator = sp_ratio_reduce(numerator, denominator)
+
+    batch_loss = numerator / (denominator + _LOSS_REDUCTION_EPS)  # shape: [1]
     return batch_loss.mean()  # shape: []
+
+
+def _sp_size() -> int:
+    """Sequence-parallel degree, or 1 when the training package is not imported."""
+    try:
+        from speculators.train.distributed import get_sp_size
+    except Exception:  # pragma: no cover - train extras not installed
+        return 1
+    return get_sp_size()

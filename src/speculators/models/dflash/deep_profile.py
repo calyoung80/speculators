@@ -1,4 +1,3 @@
-# ruff: noqa: PLC0415
 """DFlash 深层打点 (env 开关, 默认关闭)。
 
 用法: 在 dflash/model_definitions.py 与 core.py 里插入 begin/end:

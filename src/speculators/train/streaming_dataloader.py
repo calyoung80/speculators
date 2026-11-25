@@ -36,8 +36,6 @@ record is trained twice.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import gc
 import logging
 import os
 import threading
@@ -48,7 +46,6 @@ from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import torch
 
 from hs_connectors.device import ensure_thread_context
 from speculators.train.recovery import GenerationRecoveryGuard, SampleUnavailable
@@ -66,8 +63,6 @@ logger = logging.getLogger(__name__)
 # jitter tolerance, not throughput; steady state is governed by
 # ``in_flight_batches`` and the vLLM service rate.
 DEFAULT_YIELD_QUEUE_DEPTH = 4
-_MIN_QUEUED_BATCHES = 2
-_MAX_SAMPLE_LEN = int(os.environ.get("SPECULATORS_MAX_SAMPLE_LEN", "0"))
 
 _SENTINEL = object()
 
@@ -88,11 +83,14 @@ class _EpochController:
     _cached_generated_batches: tuple[int, list] = field(default=(-1, []))
 
     def set_epoch(self, epoch: int) -> None:
-        if epoch != self.loader._epoch:  # noqa: SLF001
-            self.loader._epoch = epoch  # noqa: SLF001
+        if epoch != self.loader._epoch:
+            self.loader._epoch = epoch
             # A new epoch re-slices the dataset; the previous epoch's
             # consumed bitmap refers to a different slice and must go.
-            self.loader._consumed.clear()  # noqa: SLF001
+            self.loader._consumed.clear()
+
+
+_MAX_SAMPLE_LEN = int(os.environ.get("SPECULATORS_MAX_SAMPLE_LEN", "0"))
 
 
 class StreamingPacker:
@@ -176,7 +174,7 @@ class StreamingDataLoader:
     ):
         if in_flight_batches <= 0:
             raise ValueError("in_flight_batches must be positive")
-        if max_queued_batches < _MIN_QUEUED_BATCHES:
+        if max_queued_batches < 2:
             # Below 2 the open packer bin (1) plus one outstanding send batch
             # can pin the occupancy at the limit and stall the pipeline.
             raise ValueError("max_queued_batches must be at least 2")
@@ -185,7 +183,9 @@ class StreamingDataLoader:
         if not (0 <= rank < max(world_size, 1)):
             raise ValueError(f"rank {rank} out of range for world_size {world_size}")
         if on_missing not in ("generate", "skip", "warn", "raise"):
-            raise ValueError("on_missing must be one of generate/skip/warn/raise")
+            raise ValueError(
+                "on_missing must be one of generate/skip/warn/raise"
+            )
 
         self.dataset = dataset
         self.source = source
@@ -225,9 +225,6 @@ class StreamingDataLoader:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._fetch_executor: ThreadPoolExecutor | None = None
-        self._device_index: int | None = None
-        self._fetch_recycle_interval = 0
-        self._fetches_since_recycle = 0
         self._queue: Queue = Queue(maxsize=yield_queue_depth)
         self._closed = False
         self._iterating = False
@@ -238,9 +235,7 @@ class StreamingDataLoader:
     def _slice_indices(self, epoch: int) -> np.ndarray:
         """Rank slice of the shuffled dataset (same seeding as Multipack)."""
         lengths = np.asarray(self.dataset.approx_lengths)
-        valid = np.nonzero(
-            lengths <= max(self.batch_max_length, _MAX_SAMPLE_LEN)
-        )[0]
+        valid = np.nonzero(lengths <= max(self.batch_max_length, _MAX_SAMPLE_LEN))[0]
         rng = np.random.default_rng(seed=self.seed + epoch)
         shuffled = rng.permutation(valid)
         # Multipack balances replicas via LPT; arrival-order packing cannot,
@@ -269,12 +264,10 @@ class StreamingDataLoader:
 
     def __iter__(self) -> Iterator[BatchType]:
         if self._iterating:
-            raise RuntimeError(
-                "StreamingDataLoader does not support re-entrant iteration"
-            )
+            raise RuntimeError("StreamingDataLoader does not support re-entrant iteration")
         return self._iterate()
 
-    def _iterate(self) -> Iterator[BatchType]:  # noqa: C901
+    def _iterate(self) -> Iterator[BatchType]:
         self._iterating = True
         try:
             self._pipeline_error = None
@@ -284,25 +277,19 @@ class StreamingDataLoader:
             # to device 0). CANN contexts are thread-local and mooncake's
             # adxl engine executes fabric transfers in the calling thread.
             _device_index = None
-            with contextlib.suppress(Exception):
+            try:
+                import torch
+
                 if torch.accelerator.is_available():
                     _device_index = torch.accelerator.current_device_index()
-            self._device_index = _device_index
+            except Exception:
+                pass
 
             self._fetch_executor = ThreadPoolExecutor(
                 max_workers=self.fetch_workers,
                 thread_name_prefix="speculators-streaming-fetch",
                 initializer=lambda: ensure_thread_context(_device_index),
             )
-            # Optional r8-adapted fetch recycling (off by default): each
-            # get_into can leave one payload-sized anonymous mapping that the
-            # mooncake engine only returns after the calling threads exit and
-            # a fresh event loop is created and closed (s96 probes E/O1).
-            # Enable with STREAMING_FETCH_RECYCLE=<samples per recycle>.
-            self._fetch_recycle_interval = int(
-                os.environ.get("STREAMING_FETCH_RECYCLE", "0") or 0
-            )
-            self._fetches_since_recycle = 0
             self._queue = Queue(maxsize=self.yield_queue_depth)
             self._loop = asyncio.new_event_loop()
             self._closed = False
@@ -321,7 +308,7 @@ class StreamingDataLoader:
                         if self._thread is not None and not self._thread.is_alive():
                             raise RuntimeError(
                                 "streaming loader worker thread died"
-                            ) from None
+                            )
                         continue
                     if item is _SENTINEL:
                         if self._pipeline_error is not None:
@@ -377,7 +364,7 @@ class StreamingDataLoader:
             self._closed = True
             self._queue.put(_SENTINEL)
 
-    async def _run_inner(self) -> None:  # noqa: C901
+    async def _run_inner(self) -> None:
         slice_indices = self._slice_indices(self._epoch)
         packer = StreamingPacker(self.batch_max_length)
         pending: set[asyncio.Task] = set()
@@ -427,7 +414,9 @@ class StreamingDataLoader:
                 outstanding[batch_id] = len(indices)
                 for index in indices:
                     record = self.dataset.records[index]
-                    task = asyncio.create_task(self._generate(index, record, batch_id))
+                    task = asyncio.create_task(
+                        self._generate(index, record, batch_id)
+                    )
                     pending.add(task)
                     task_batch[task] = batch_id
 
@@ -466,16 +455,9 @@ class StreamingDataLoader:
             for future in fetches:
                 if future.done():
                     fetch_pending -= 1
-                    self._fetches_since_recycle += 1
                     if future.exception() is not None:
                         future.result()
             fetches = [future for future in fetches if not future.done()]
-            if (
-                self._fetch_recycle_interval > 0
-                and not fetches
-                and self._fetches_since_recycle >= self._fetch_recycle_interval
-            ):
-                self._recycle_fetch_executor()
 
         final = packer.flush()
         if final is not None:
@@ -537,47 +519,20 @@ class StreamingDataLoader:
                 raise
             if self.on_missing == "warn":
                 logger.warning(
-                    "Streaming generation failed for storage index %s: %r; skipping",
+                    "Streaming generation failed for storage index %s: %r; "
+                    "skipping",
                     record.storage_index,
                     exc,
                 )
-            return (
-                index,
-                record,
-                SampleUnavailable(
-                    reason=f"Streaming generation failed: {exc!r}",
-                    counts_as_failure=True,
-                ),
+            return index, record, SampleUnavailable(
+                reason=f"Streaming generation failed: {exc!r}",
+                counts_as_failure=True,
             )
         return index, record, receipt
 
     def _submit_fetch(self, entries: list[_PendingEntry]) -> Future:
-        if self._fetch_executor is None:
-            raise RuntimeError("streaming fetch executor is not running")
+        assert self._fetch_executor is not None
         return self._fetch_executor.submit(self._fetch_and_assemble, entries)
-
-    def _recycle_fetch_executor(self) -> None:
-        """Return leaked mooncake receive buffers to the OS (r8, streaming).
-
-        Same recipe as ``VllmHiddenStatesSource._recycle_transfer_executor``:
-        retire the fetch threads (each ``get_into`` can retain one
-        payload-sized anonymous mapping), create+close a fresh event loop on
-        this thread to release the engine's per-thread native state, then
-        recreate the pool; the initializer re-binds the NPU context (CANN
-        contexts are thread-local). Only called with no fetch in flight.
-        """
-        if self._fetch_executor is not None:
-            self._fetch_executor.shutdown(wait=True)
-            self._fetch_executor = None
-        fresh_loop = asyncio.new_event_loop()
-        fresh_loop.close()
-        gc.collect()
-        self._fetch_executor = ThreadPoolExecutor(
-            max_workers=self.fetch_workers,
-            thread_name_prefix="speculators-streaming-fetch",
-            initializer=lambda: ensure_thread_context(self._device_index),
-        )
-        self._fetches_since_recycle = 0
 
     def _fetch_and_assemble(
         self, entries: list[_PendingEntry]
@@ -611,7 +566,8 @@ class StreamingDataLoader:
                         raise
                     if self.on_missing in ("warn", "generate") and attempt == attempts:
                         logger.warning(
-                            "Streaming fetch failed for handle %s: %r; skipping sample",
+                            "Streaming fetch failed for handle %s: %r; "
+                            "skipping sample",
                             entry.receipt.handle,
                             exc,
                         )

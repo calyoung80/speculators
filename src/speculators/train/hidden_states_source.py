@@ -1,7 +1,6 @@
 """Hidden-state acquisition for training data."""
 
 import asyncio
-import contextlib
 import gc
 import logging
 import uuid
@@ -12,9 +11,9 @@ from typing import Any, Literal, Protocol, cast
 
 import openai
 import torch
-from hs_connectors.device import ensure_thread_context
 
 from hs_connectors import HiddenStatesTransfer
+from hs_connectors.device import ensure_thread_context
 from speculators.data_generation.offline import check_hidden_states
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
@@ -180,27 +179,25 @@ class VllmHiddenStatesSource:
 
         self.transfer.setup()
         if self._device_index is None:
-            with contextlib.suppress(Exception):  # CPU-only hosts
+            try:
                 if torch.accelerator.is_available():
                     self._device_index = torch.accelerator.current_device_index()
+            except Exception:  # noqa: BLE001 - CPU-only hosts
+                pass
         if self._transfer_executor is None:
             self._transfer_executor = ThreadPoolExecutor(
                 max_workers=self.max_transfer_workers,
                 thread_name_prefix="speculators-hidden-state-transfer",
                 initializer=lambda: ensure_thread_context(self._device_index),
             )
+        # The streaming client is NOT created here: the torch path (get_batch)
+        # would prime a connection pool it never uses, and close() would then
+        # have to tear it down. generate() creates it lazily on first use.
         self._is_setup = True
 
     def setup(self) -> None:
-        """Public setup for non-DataLoader consumers (streaming loader).
-
-        Primes the persistent client on the caller's thread: the streaming
-        loader calls this from its main thread before starting the pipeline
-        event loop, so the client is created under the trackable context.
-        """
+        """Public setup so non-DataLoader consumers can prime the client."""
         self._setup()
-        if self._client is None:
-            self._client = self._make_client()
 
     def _recycle_transfer_executor(self) -> None:
         """Return leaked Mooncake receive buffers to the OS (r8).
@@ -410,8 +407,9 @@ class VllmHiddenStatesSource:
         if self._client is not None:
             runner = asyncio.Runner()
             try:
-                with contextlib.suppress(Exception):  # best-effort close
-                    runner.run(self._client.close())
+                runner.run(self._client.close())
+            except Exception:  # noqa: BLE001 - best-effort close
+                pass
             finally:
                 runner.close()
             self._client = None

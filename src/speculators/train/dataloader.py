@@ -9,6 +9,11 @@ if TYPE_CHECKING:
 import os
 
 import torch
+
+# Use file_system sharing to avoid /dev/shm exhaustion (64GB limit in
+# Docker). Must be set at module import time so both the main process
+# and spawned DataLoader workers pick it up.
+torch.multiprocessing.set_sharing_strategy("file_system")
 from torch.utils.data import DataLoader
 
 from hs_connectors import FileTransfer, HiddenStatesTransfer
@@ -27,11 +32,6 @@ from speculators.train.hidden_states_source import (
     VllmHiddenStatesSource,
 )
 from speculators.train.streaming_dataloader import StreamingDataLoader
-
-# Use file_system sharing to avoid /dev/shm exhaustion (64GB limit in
-# Docker). Must be set at module import time so both the main process
-# and spawned DataLoader workers pick it up.
-torch.multiprocessing.set_sharing_strategy("file_system")
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +55,11 @@ def _limit_worker_threads() -> None:
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 
+
 def _configure_sharing_strategy() -> None:
     """Use file_system sharing to avoid /dev/shm exhaustion."""
+    import torch.multiprocessing
     torch.multiprocessing.set_sharing_strategy("file_system")
-
 
 def _worker_init_fn(worker_id: int) -> None:  # noqa: ARG001
     torch.set_num_threads(1)
